@@ -87,19 +87,54 @@ os.makedirs(save_results_folder, exist_ok=True)
 """                                Make dataset                                     """
 #######################################################################################
 
-dataset = LoadDataSet(
-    data_name=args.data_name,
-    data_path=args.data_path,
-    min_label=args.min_label,
-    max_label=args.max_label,
-    img_size=args.image_size,
-    max_num_img_per_label=args.max_num_img_per_label,
-    num_img_per_label_after_replica=args.num_img_per_label_after_replica,
-)
+if args.dataset == "power_vector":
+    from utils import PowerSeqDataset, PowerTransformer
 
-train_images, train_labels, train_labels_norm = dataset.load_train_data()
+    # initialize Power transformer and train
+    power_transformer = PowerTransformer()
 
-unique_labels_norm = np.sort(np.array(list(set(train_labels_norm))))
+    # load Power dataset
+    dataset = PowerSeqDataset(
+        design_folder=args.design_folder,
+        power_path=args.power_data_path,
+        power_transformer=power_transformer,
+        normalize_design=True,
+    )
+
+    # prepare training data
+    train_data = []
+    for i in range(len(dataset)):
+        batch = dataset[i]
+        train_data.append((batch["design"], batch["labels"].squeeze(0)))
+
+    # separate images and labels
+    train_images = torch.stack([item[0] for item in train_data]).numpy()
+    train_labels = torch.stack([item[1] for item in train_data]).numpy()
+    train_labels_norm = train_labels.copy()  # normalized labels
+
+    # unique labels
+    unique_labels_norm = np.unique(train_labels_norm, axis=0)
+
+    # multi-dim label
+    args.label_dim = train_labels.shape[1]
+
+else:
+    # keep original dataset
+    dataset = LoadDataSet(
+        data_name=args.data_name,
+        data_path=args.data_path,
+        min_label=args.min_label,
+        max_label=args.max_label,
+        img_size=args.image_size,
+        max_num_img_per_label=args.max_num_img_per_label,
+        num_img_per_label_after_replica=args.num_img_per_label_after_replica,
+    )
+
+    train_images, train_labels, train_labels_norm = dataset.load_train_data()
+    unique_labels_norm = np.sort(np.array(list(set(train_labels_norm))))
+
+    # single-dim label
+    args.label_dim = 1
 
 
 if args.kernel_sigma < 0:
