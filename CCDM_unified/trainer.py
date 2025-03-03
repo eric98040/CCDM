@@ -26,6 +26,7 @@ from tqdm.auto import tqdm
 from accelerate import Accelerator
 
 from ema_pytorch import EMA
+from diffusion import generate_random_vectors, compute_distance, compute_projection
 from utils import (
     cycle,
     divisible_by,
@@ -113,7 +114,7 @@ class Trainer(object):
         )
 
         # model
-        self.model = diffusion_model  ##diffusion model instead of unet
+        self.model = diffusion_model  # diffusion model instead of unet
         self.channels = diffusion_model.channels
 
         # sampling and training hyperparameters
