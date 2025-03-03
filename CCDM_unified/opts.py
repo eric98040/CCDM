@@ -85,6 +85,25 @@ def parse_opts():
         default=1,
         help="Number of random projections (M) for Sliced Vicinal Loss",
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="default",
+        choices=["default", "power_vector"],
+        help="Dataset type to use",
+    )
+    parser.add_argument(
+        "--power_data_path",
+        type=str,
+        default="./data/0130_40_generated_power_array1_drop3.csv",
+        help="Path to power vector CSV file",
+    )
+    parser.add_argument(
+        "--design_folder",
+        type=str,
+        default="./data/image/",
+        help="Path to design image folder",
+    )
 
     """ Dataset """
     parser.add_argument("--min_label", type=float, default=0.0)
