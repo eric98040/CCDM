@@ -198,7 +198,8 @@ if args.kappa < 0:
                 diff_list.append(unique_labels_norm[i] - unique_labels_norm[i - 1])
             kappa_base = np.max(np.array(diff_list))
 
-        if args.threshold_type == "hard" or args.vicinity_type in ["hv", "shv"]:
+        is_hard_vicinity = args.vicinity_type in ["hv", "shv"]
+        if is_hard_vicinity:
             args.kappa = np.abs(args.kappa) * kappa_base
         else:
             args.kappa = 1 / (np.abs(args.kappa) * kappa_base) ** 2
@@ -330,6 +331,7 @@ diffusion = GaussianDiffusion(
     objective=args.pred_objective,
     beta_schedule=args.beta_schedule,
     ddim_sampling_eta=args.ddim_eta,
+    vicinity_type=args.vicinity_type,
 ).cuda()
 
 
