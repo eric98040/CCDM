@@ -99,6 +99,7 @@ def compute_projection(y, v):
 
 
 class GaussianDiffusion(nn.Module):
+
     def __init__(
         self,
         model,
@@ -116,6 +117,7 @@ class GaussianDiffusion(nn.Module):
         min_snr_loss_weight=False,
         min_snr_gamma=5,
         use_cfg_plus_plus=False,  # https://arxiv.org/pdf/2406.08070
+        vicinity_type="shv",
     ):
         super().__init__()
         assert not (
@@ -126,6 +128,7 @@ class GaussianDiffusion(nn.Module):
 
         self.model = model
         self.channels = self.model.module.in_channels
+        self.vicinity_type = vicinity_type
 
         # use y dependent covariance matrix
         self.use_Hy = use_Hy
@@ -520,7 +523,10 @@ class GaussianDiffusion(nn.Module):
         Returns:
         - loss: Computed loss value
         """
-        vicinity_type = kwargs.get("vicinity_type", "shv")  # shv, ssv, hv, sv
+        vicinity_type = kwargs.get("vicinity_type", self.vicinity_type)
+        is_hard_vicinity = vicinity_type in ["hv", "shv"]
+        is_sliced = vicinity_type in ["shv", "ssv"]
+
         kappa = kwargs.get("kappa", 0.01)
         vector_type = kwargs.get("vector_type", "gaussian")
         num_projections = kwargs.get("num_projections", 1)
@@ -585,11 +591,7 @@ class GaussianDiffusion(nn.Module):
             loss = torch.sum(loss, dim=1)
 
             # For multi-dimensional labels
-            if (
-                vicinity_type in ["shv", "ssv"]
-                and labels.dim() > 1
-                and labels.shape[1] > 1
-            ):
+            if is_sliced and labels.dim() > 1 and labels.shape[1] > 1:
                 device = labels.device
                 dim = labels.shape[1]
 
@@ -624,7 +626,7 @@ class GaussianDiffusion(nn.Module):
                         0
                     )  # [B, B]
 
-                    if vicinity_type == "shv":  # Sliced Hard Vicinal
+                    if is_hard_vicinity:  # Sliced Hard Vicinal
                         # Calculate effective kappa based on projection vector norm
                         effective_kappa = kappa * torch.norm(proj_vec) + 1e-8
 
@@ -656,7 +658,7 @@ class GaussianDiffusion(nn.Module):
                 # Apply weights to loss
                 loss = torch.sum(batch_weights * loss) / (b * c * h * w)
 
-            elif vicinity_type in ["hv", "sv"]:  # Traditional Hard/Soft Vicinal
+            else:  # Traditional Hard/Soft Vicinal
                 # Initialize weights
                 batch_weights = torch.zeros_like(vicinal_weights)
 
@@ -698,7 +700,7 @@ class GaussianDiffusion(nn.Module):
                         pairwise_dist = torch.abs(diff)
 
                 # Apply vicinity weights
-                if vicinity_type == "hv":  # Hard Vicinal
+                if is_hard_vicinity:  # Hard Vicinal
                     # Create binary mask for vicinity
                     vicinity_mask = (pairwise_dist <= kappa).float()  # [B, B]
                     # Sum over all labels in vicinity for each sample
