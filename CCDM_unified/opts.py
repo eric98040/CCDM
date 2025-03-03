@@ -41,7 +41,7 @@ def parse_opts():
         type=str,
         default="shv",
         choices=["shv", "ssv", "hv", "sv"],
-        help="Type of vicinity loss: Sliced Hard Vicinal (shv), Sliced Soft Vicinal (ssv), Hard Vicinal (hv), Soft Vicinal (sv)",
+        help="Type of vicinity loss: Sliced Hard Vicinal (shv), Sliced Soft Vicinal (ssv), Hard Vicinal (hv), Soft Vicinal (sv). 'Hard' uses indicator functions, 'Soft' uses Gaussian kernels.",
     )
     parser.add_argument(
         "--distance",
@@ -189,9 +189,6 @@ def parse_opts():
         type=float,
         default=-1.0,
         help="If kernel_sigma<0, then use rule-of-thumb formula to compute the sigma.",
-    )
-    parser.add_argument(
-        "--threshold_type", type=str, default="hard", choices=["soft", "hard"]
     )
     parser.add_argument("--kappa", type=float, default=-1)
     parser.add_argument(
