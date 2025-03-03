@@ -99,10 +99,12 @@ class LabelEmbed:
         self.label_dim = label_dim
         self.dim_weights_learn = dim_weights_learn
         self.dim_combination = dim_combination
+        self.device = device
 
         # Initialize dimension weights if needed
         if dim_weights_learn and label_dim > 1:
             self.dim_weights = nn.Parameter(torch.ones(label_dim) / label_dim)
+            self.dim_weights = self.dim_weights.to(device)
 
         # Initialize attention mechanism for dimension combination if needed
         if dim_combination == "attention" and label_dim > 1:
@@ -121,7 +123,38 @@ class LabelEmbed:
             ).to(device)
 
         # Initialize embedding networks based on types
-        # ... (existing initialization code) ...
+        if y2h_type == "resnet":
+            # Initialize ResNet-based model for y2h
+            os.makedirs(path_y2h, exist_ok=True)
+            if not os.path.exists(path_y2h + "/net_y2h.pth"):
+                print("\n Start training ResNet for label embedding...")
+                # Training logic will be handled elsewhere
+                pass
+            # Load the pre-trained model
+            self.model_mlp_y2h = model_y2h(dim_embed=h_dim)
+            self.model_mlp_y2h.load_state_dict(torch.load(path_y2h + "/net_y2h.pth"))
+            self.model_mlp_y2h.eval()
+
+        # Initialize covariance embedding network if needed
+        if y2cov_type == "resnet" and path_y2cov is not None:
+            os.makedirs(path_y2cov, exist_ok=True)
+            if not os.path.exists(path_y2cov + "/net_y2cov.pth"):
+                print("\n Start training ResNet for covariance embedding...")
+                # Training logic will be handled elsewhere
+                pass
+            # Load the pre-trained model
+            self.model_mlp_y2cov = model_y2cov(dim_embed=cov_dim)
+            self.model_mlp_y2cov.load_state_dict(
+                torch.load(path_y2cov + "/net_y2cov.pth")
+            )
+            self.model_mlp_y2cov.eval()
+
+        # Initialize Gaussian Fourier projection if needed
+        if y2h_type == "gaussian":
+            self.gfp_h = GaussianFourierProjection(embed_dim=h_dim).to(device)
+
+        if y2cov_type == "gaussian" and cov_dim is not None:
+            self.gfp_cov = GaussianFourierProjection(embed_dim=cov_dim).to(device)
 
     def fn_y2h(self, labels):
         """
@@ -206,7 +239,7 @@ class LabelEmbed:
                 dim_embeddings = []
                 for d in range(labels.shape[1]):
                     dim_labels = labels[:, d].view(-1, 1)
-                    dim_embed = GaussianFourierProjection(embed_dim)(dim_labels)
+                    dim_embed = self.gfp_h(dim_labels)
                     dim_embeddings.append(dim_embed)
 
                 # Stack and process based on combination method
@@ -238,9 +271,43 @@ class LabelEmbed:
                     embedding = torch.mean(stacked_embeddings, dim=0)
 
             elif self.y2h_type == "resnet":
-                # For ResNet-based embedding, we need to modify the architecture
-                # to support multi-dimensional labels
-                embedding = self.model_mlp_y2h(labels)
+                # For ResNet-based embedding, adapt to handle multi-dimensional labels
+                self.model_mlp_y2h.eval()
+                self.model_mlp_y2h = self.model_mlp_y2h.to(device)
+
+                # Process each dimension separately
+                dim_embeddings = []
+                for d in range(labels.shape[1]):
+                    dim_labels = labels[:, d].view(-1, 1)
+                    dim_embed = self.model_mlp_y2h(dim_labels)
+                    dim_embeddings.append(dim_embed)
+
+                # Combine embeddings based on selected method
+                stacked_embeddings = torch.stack(dim_embeddings)
+
+                if self.dim_combination == "mean":
+                    embedding = torch.mean(stacked_embeddings, dim=0)
+                elif self.dim_combination == "weighted":
+                    if self.dim_weights_learn:
+                        weights = F.softmax(self.dim_weights, dim=0)
+                        embedding = torch.sum(
+                            stacked_embeddings * weights.view(-1, 1, 1), dim=0
+                        )
+                    else:
+                        embedding = torch.mean(stacked_embeddings, dim=0)
+                elif self.dim_combination == "attention":
+                    stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
+                    attn_scores = self.attention_layer(stacked_for_attn).squeeze(-1)
+                    attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
+                    embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
+                elif self.dim_combination == "cross":
+                    B, D = labels.shape[0], labels.shape[1]
+                    flat_embeddings = stacked_embeddings.permute(1, 0, 2).reshape(
+                        B, D * embed_dim
+                    )
+                    embedding = self.cross_dim_interaction(flat_embeddings)
+                else:
+                    embedding = torch.mean(stacked_embeddings, dim=0)
 
         else:
             # Original single-dimension embedding code
@@ -262,12 +329,17 @@ class LabelEmbed:
                 embedding = (embedding + 1) / 2
 
             elif self.y2h_type == "gaussian":
-                embedding = GaussianFourierProjection(embed_dim=embed_dim)(labels)
+                if hasattr(self, "gfp_h"):
+                    embedding = self.gfp_h(labels.view(-1, 1))
+                else:
+                    embedding = GaussianFourierProjection(embed_dim=embed_dim)(
+                        labels.view(-1, 1)
+                    )
                 embedding = (embedding + 1) / 2
 
             elif self.y2h_type == "resnet":
                 self.model_mlp_y2h.eval()
-                self.model_mlp_y2h = self.model_mlp_y2h.cuda()
+                self.model_mlp_y2h = self.model_mlp_y2h.to(labels.device)
                 embedding = self.model_mlp_y2h(labels)
 
         return embedding
@@ -284,6 +356,9 @@ class LabelEmbed:
         - embedding: Embedded labels for covariance [B, cov_dim]
         """
         embed_dim = self.cov_dim
+        if embed_dim is None:
+            # Default to image dimensions if not specified
+            embed_dim = 32 * 32 * self.nc
 
         # Handle multi-dimensional labels
         if len(labels.shape) > 1 and labels.shape[1] > 1:
@@ -351,7 +426,12 @@ class LabelEmbed:
                 dim_embeddings = []
                 for d in range(labels.shape[1]):
                     dim_labels = labels[:, d].view(-1, 1)
-                    dim_embed = GaussianFourierProjection(embed_dim)(dim_labels)
+                    if hasattr(self, "gfp_cov"):
+                        dim_embed = self.gfp_cov(dim_labels)
+                    else:
+                        dim_embed = GaussianFourierProjection(embed_dim=embed_dim)(
+                            dim_labels
+                        )
                     # Ensure positive embeddings for covariance
                     dim_embed = dim_embed + 1
                     dim_embeddings.append(dim_embed)
@@ -386,8 +466,41 @@ class LabelEmbed:
             elif self.y2cov_type == "resnet":
                 # For ResNet-based embedding
                 self.model_mlp_y2cov.eval()
-                self.model_mlp_y2cov = self.model_mlp_y2cov.cuda()
-                embedding = self.model_mlp_y2cov(labels)
+                self.model_mlp_y2cov = self.model_mlp_y2cov.to(device)
+
+                # Process each dimension separately
+                dim_embeddings = []
+                for d in range(labels.shape[1]):
+                    dim_labels = labels[:, d].view(-1, 1)
+                    dim_embed = self.model_mlp_y2cov(dim_labels)
+                    dim_embeddings.append(dim_embed)
+
+                # Combine embeddings based on selected method
+                stacked_embeddings = torch.stack(dim_embeddings)
+
+                if self.dim_combination == "mean":
+                    embedding = torch.mean(stacked_embeddings, dim=0)
+                elif self.dim_combination == "weighted":
+                    if self.dim_weights_learn:
+                        weights = F.softmax(self.dim_weights, dim=0)
+                        embedding = torch.sum(
+                            stacked_embeddings * weights.view(-1, 1, 1), dim=0
+                        )
+                    else:
+                        embedding = torch.mean(stacked_embeddings, dim=0)
+                elif self.dim_combination == "attention":
+                    stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
+                    attn_scores = self.attention_layer(stacked_for_attn).squeeze(-1)
+                    attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
+                    embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
+                elif self.dim_combination == "cross":
+                    B, D = labels.shape[0], labels.shape[1]
+                    flat_embeddings = stacked_embeddings.permute(1, 0, 2).reshape(
+                        B, D * embed_dim
+                    )
+                    embedding = self.cross_dim_interaction(flat_embeddings)
+                else:
+                    embedding = torch.mean(stacked_embeddings, dim=0)
 
         else:
             # Original single-dimension embedding
@@ -409,12 +522,17 @@ class LabelEmbed:
                 embedding = embedding + 1  # make sure the embedding is not negative
 
             elif self.y2cov_type == "gaussian":
-                embedding = GaussianFourierProjection(embed_dim=embed_dim)(labels)
+                if hasattr(self, "gfp_cov"):
+                    embedding = self.gfp_cov(labels.view(-1, 1))
+                else:
+                    embedding = GaussianFourierProjection(embed_dim=embed_dim)(
+                        labels.view(-1, 1)
+                    )
                 embedding = embedding + 1  # make sure the embedding is not negative
 
             elif self.y2cov_type == "resnet":
                 self.model_mlp_y2cov.eval()
-                self.model_mlp_y2cov = self.model_mlp_y2cov.cuda()
+                self.model_mlp_y2cov = self.model_mlp_y2cov.to(labels.device)
                 embedding = self.model_mlp_y2cov(labels)
 
         return embedding
@@ -580,7 +698,18 @@ def train_mlp(
             param_group["lr"] = lr
 
     assert np.max(unique_labels_norm) <= 1 and np.min(unique_labels_norm) >= 0
-    trainset = label_dataset(unique_labels_norm)
+
+    # Handle multi-dimensional labels if necessary
+    if len(unique_labels_norm.shape) > 1 and unique_labels_norm.shape[1] > 1:
+        # Transform multi-dimensional labels into dataset
+        trainset = []
+        for label in unique_labels_norm:
+            for dim_idx in range(len(label)):
+                trainset.append(label[dim_idx])
+        trainset = label_dataset(np.array(trainset))
+    else:
+        trainset = label_dataset(unique_labels_norm)
+
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True
     )
@@ -636,24 +765,3 @@ def train_mlp(
     # end for epoch
 
     return model_mlp
-
-
-# if __name__ == "__main__":
-
-#     label_embedding = LabelEmbed(dataset="RC-49", path_y2h="./", path_y2cov="./", type="sinusoidal")
-#     y = torch.randn(10, 1).cuda()
-#     print(label_embedding.fn_y2h(y).shape)
-#     print(label_embedding.fn_y2cov(y).shape)
-
-
-#     from dataset import LoadDataSet
-
-#     file_path = 'C:/Users/DX/BaiduSyncdisk/Baidu_WD/datasets/CCGM_or_regression/RC-49'
-#     dataset = LoadDataSet(data_name="RC-49", data_path=file_path, min_label=0, max_label=90, img_size=64, max_num_img_per_label=25, num_img_per_label_after_replica=0)
-
-#     label_embedding = LabelEmbed(dataset=dataset, path_y2h="./output/model_y2h", path_y2cov="./output/model_y2cov", type="resnet")
-
-#     y = torch.randn(10, 1)
-
-#     print(label_embedding.fn_y2h(y).shape)
-#     print(label_embedding.fn_y2cov(y).shape)
