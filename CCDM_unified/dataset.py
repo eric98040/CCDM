@@ -1,310 +1,253 @@
-# prepare training dataset. The images and labels are in numpy array
-
 import os
 import numpy as np
 import h5py
 import copy
 import torch
 from tqdm import tqdm, trange
+import joblib
+from PIL import Image
+from torchvision import transforms as T
+from sklearn.preprocessing import QuantileTransformer
 
-class LoadDataSet:
-    def __init__(self, data_name, data_path, min_label, max_label, img_size=64, max_num_img_per_label=1e30, num_img_per_label_after_replica=0):
+
+class PowerTransformer:
+    """Power transformer for normalizing power values"""
+
+    def __init__(self, n_quantiles=1000, output_distribution="normal"):
+        self.qt = QuantileTransformer(
+            n_quantiles=n_quantiles,
+            output_distribution=output_distribution,
+            random_state=42,
+        )
+        self.max_power = 240000
+        self.output_distribution = output_distribution
+
+    def fit(self, power_sequences):
         """
-        data_name: the name of the dataset; must be one of ['RC-49', 'Cell200', 'UTKFace', 'SteeringAngle']
-        data_path: the path to the h5 file
-        min_label: the minimum label
-        max_label: the maximum label
-        img_size: image size
-        max_num_img_per_label: the maximum number of images for each distinct label that will be used for training
-        num_img_per_label_after_replica: the number of images for each distinct label that will be used for training
+        Fit power sequences
+        Args:
+            power_sequences: shape (N, D) array of power sequences
         """
-        
-        self.data_name = data_name
-        self.data_path = data_path
-        self.min_label = min_label
-        self.max_label = max_label
-        self.img_size = img_size
-        self.max_num_img_per_label = max_num_img_per_label
-        self.num_img_per_label_after_replica = num_img_per_label_after_replica
-        
-        ## load the entire dataset from h5 file
-        with h5py.File(self.data_path+'/{}_{}x{}.h5'.format(self.data_name, self.img_size, self.img_size), 'r') as hf:
-            if self.data_name == "RC-49":
-                ## load h5 file
-                self.labels_all = hf['labels'][:].astype(float)
-                self.images_all = hf['images'][:]
-                self.indx_train = hf['indx_train'][:]
-                hf.close()
-                print("\n Loaded entire RC-49 dataset: {}x{}x{}x{}".format(self.images_all.shape[0], self.images_all.shape[1], self.images_all.shape[2], self.images_all.shape[3]))
+        # Reshape to handle full sequences
+        values = power_sequences.reshape(-1, 1) / self.max_power
+        self.qt.fit(values)
+        return self
 
-            elif self.data_name == "UTKFace":
-                ## load h5 file
-                self.labels_all = hf['labels'][:].astype(float)
-                self.images_all = hf['images'][:]
-                hf.close()
-                print("\n Loaded entire UTKFace dataset: {}x{}x{}x{}".format(self.images_all.shape[0], self.images_all.shape[1], self.images_all.shape[2], self.images_all.shape[3]))
-                
-            elif self.data_name == "Cell200":
-                ## load h5 file
-                self.labels_all = hf['CellCounts'][:].astype(float)
-                self.images_all = hf['IMGs_grey'][:]
-                hf.close()        
-                print("\n Loaded entire Cell200 dataset: {}x{}x{}x{}".format(self.images_all.shape[0], self.images_all.shape[1], self.images_all.shape[2], self.images_all.shape[3]))
-            
-            elif self.data_name == "SteeringAngle":
-                ## load h5 file
-                self.labels_all = hf['labels'][:].astype(float)
-                self.images_all = hf['images'][:]
-                hf.close()
-                print("\n Loaded entire SteeringAngle dataset: {}x{}x{}x{}".format(self.images_all.shape[0], self.images_all.shape[1], self.images_all.shape[2], self.images_all.shape[3]))
-                
-            else:
-                raise ValueError("Not Supported Dataset!")
-        
-        if self.data_name == "SteeringAngle":
-            indx = np.where((self.labels_all>self.min_label)*(self.labels_all<self.max_label)==True)[0]
-            self.min_label_before_shift = np.min(self.labels_all[indx])
-            self.max_label_after_shift = np.max(self.labels_all[indx]+np.abs(self.min_label_before_shift))
-    
-    ## load training data
-    def load_train_data(self):
-        
-        if self.data_name == "RC-49":
-            images = self.images_all[self.indx_train]
-            labels = self.labels_all[self.indx_train]
+    def transform(self, power_sequences):
+        """
+        Transform power sequences
+        Args:
+            power_sequences: shape (N, D) or (D,) array of power sequences
+        Returns:
+            Transformed sequences in same shape
+        """
+        original_shape = power_sequences.shape
+        normalized = power_sequences.reshape(-1, 1) / self.max_power
 
-            ## Extract a subset from the entire dataset.
-            indx = np.where((labels>self.min_label)*(labels<self.max_label)==True)[0]
-            labels = labels[indx]
-            images = images[indx]
-            
-            ## for each distinct label, take no more than max_num_img_per_label images
-            print("\n The original training set contains {} images with labels in [{},{}]; for each label, select no more than {} images.>>>".format(len(images), self.min_label, self.max_label, self.max_num_img_per_label))
-            sel_indx = []
-            unique_labels = np.sort(np.array(list(set(labels))))
-            for i in range(len(unique_labels)):
-                indx_i = np.where(labels == unique_labels[i])[0]
-                if len(indx_i)>self.max_num_img_per_label:
-                    np.random.shuffle(indx_i)
-                    indx_i = indx_i[0:self.max_num_img_per_label]
-                sel_indx.append(indx_i)
-            sel_indx = np.concatenate(sel_indx)
-            
-            images = images[sel_indx]
-            labels = labels[sel_indx]
-            
-            print("\r {} images left and there are {} unique labels".format(len(images), len(set(labels))))
-            
-        elif self.data_name == "UTKFace":
-            ## Extract a subset from the entire dataset.
-            images = []
-            labels = []
-            selected_labels = np.arange(self.min_label, self.max_label+1)
-            for i in range(len(selected_labels)):
-                curr_label = selected_labels[i]
-                index_curr_label = np.where(self.labels_all==curr_label)[0]
-                images.append(self.images_all[index_curr_label])
-                labels.append(self.labels_all[index_curr_label])
-            # for i
-            images = np.concatenate(images, axis=0)
-            labels = np.concatenate(labels)
-            
-            ## for each distinct label, take no more than max_num_img_per_label images
-            print("\n The original training set contains {} images with labels in [{},{}]; for each label, select no more than {} images.>>>".format(len(images), self.min_label, self.max_label, self.max_num_img_per_label))
-            sel_indx = []
-            unique_labels = np.sort(np.array(list(set(labels))))
-            for i in range(len(unique_labels)):
-                indx_i = np.where(labels == unique_labels[i])[0]
-                if len(indx_i)>self.max_num_img_per_label:
-                    np.random.shuffle(indx_i)
-                    indx_i = indx_i[0:self.max_num_img_per_label]
-                sel_indx.append(indx_i)
-            sel_indx = np.concatenate(sel_indx)
-            
-            images = images[sel_indx]
-            labels = labels[sel_indx]
-            
-            print("\r {} images left and there are {} unique labels".format(len(images), len(set(labels))))
-            
-            ## replicate minority samples to alleviate the data imbalance issue
-            max_num_img_per_label_after_replica = np.min([self.num_img_per_label_after_replica, self.max_num_img_per_label])
-            if max_num_img_per_label_after_replica>1:
-                unique_labels_replica = np.sort(np.array(list(set(labels))))
-                num_labels_replicated = 0
-                print("\n Start replicating minority samples >>>")
-                for i in trange(len(unique_labels_replica)):
-                    curr_label = unique_labels_replica[i]
-                    indx_i = np.where(labels == curr_label)[0]
-                    if len(indx_i) < max_num_img_per_label_after_replica:
-                        num_img_less = int(max_num_img_per_label_after_replica - len(indx_i))
-                        indx_replica = np.random.choice(indx_i, size = num_img_less, replace=True)
-                        if num_labels_replicated == 0:
-                            images_replica = images[indx_replica]
-                            labels_replica = labels[indx_replica]
-                        else:
-                            images_replica = np.concatenate((images_replica, images[indx_replica]), axis=0)
-                            labels_replica = np.concatenate((labels_replica, labels[indx_replica]))
-                        num_labels_replicated+=1
-                #end for i
-                images = np.concatenate((images, images_replica), axis=0)
-                labels = np.concatenate((labels, labels_replica))
-                print("\r We replicate {} images and labels.".format(len(images_replica)))
-        
-        elif self.data_name == "Cell200":
-            ## Extract a subset from the entire dataset.
-            images = []
-            labels = []
-            selected_labels = np.arange(self.min_label, self.max_label+1)
-            for i in range(len(selected_labels)):
-                curr_label = selected_labels[i]
-                index_curr_label = np.where(self.labels_all==curr_label)[0]
-                images.append(self.images_all[index_curr_label])
-                labels.append(self.labels_all[index_curr_label])
-            # for i
-            images = np.concatenate(images, axis=0)
-            labels = np.concatenate(labels)       
-            
-            # for each distinct label, take no more than max_num_img_per_label images
-            print("\n The original training set contains {} images with labels in [{},{}]; for each label, select no more than {} images.>>>".format(len(images), self.min_label, self.max_label, self.max_num_img_per_label))
-            step_size = 2
-            selected_labels = np.arange(self.min_label, self.max_label+1, step_size) # only take images with odd labels for training
-            n_unique_labels = len(selected_labels)
-            images_subset = []
-            labels_subset = []
-            for i in range(n_unique_labels):
-                curr_label = selected_labels[i]
-                index_curr_label = np.where(labels==curr_label)[0]
-                images_subset.append(images[index_curr_label[0:min(self.max_num_img_per_label, len(index_curr_label))]])
-                labels_subset.append(labels[index_curr_label[0:min(self.max_num_img_per_label, len(index_curr_label))]])
-            # for i
-            images = np.concatenate(images_subset, axis=0)
-            labels = np.concatenate(labels_subset)
-            
-            print("\r {} images left and there are {} unique labels".format(len(images), len(set(labels))))
-        
-        elif self.data_name == "SteeringAngle":
-            indx = np.where((self.labels_all>self.min_label)*(self.labels_all<self.max_label)==True)[0]
-            labels = self.labels_all[indx]
-            images = self.images_all[indx]
-            
-            ## replicate minority samples to alleviate the data imbalance issue
-            max_num_img_per_label_after_replica = np.min([self.num_img_per_label_after_replica, self.max_num_img_per_label])
-            if max_num_img_per_label_after_replica>1:
-                unique_labels_replica = np.sort(np.array(list(set(labels))))
-                num_labels_replicated = 0
-                print("\n Start replicating monority samples >>>")
-                for i in trange(len(unique_labels_replica)):
-                    curr_label = unique_labels_replica[i]
-                    indx_i = np.where(labels == curr_label)[0]
-                    if len(indx_i) < max_num_img_per_label_after_replica:
-                        num_img_less = int(max_num_img_per_label_after_replica - len(indx_i))
-                        indx_replica = np.random.choice(indx_i, size = num_img_less, replace=True)
-                        if num_labels_replicated == 0:
-                            images_replica = images[indx_replica]
-                            labels_replica = labels[indx_replica]
-                        else:
-                            images_replica = np.concatenate((images_replica, images[indx_replica]), axis=0)
-                            labels_replica = np.concatenate((labels_replica, labels[indx_replica]))
-                        num_labels_replicated+=1
-                #end for i
-                images = np.concatenate((images, images_replica), axis=0)
-                labels = np.concatenate((labels, labels_replica))
-                print("\r We replicate {} images and labels.".format(len(images_replica)))
-            
-            print("\r {} images left and there are {} unique labels".format(len(images), len(set(labels))))
-        
+        if self.output_distribution == "normal":
+            transformed = self.qt.transform(normalized)
+            transformed = (transformed - transformed.min()) / (
+                transformed.max() - transformed.min()
+            )
         else:
-            raise ValueError("Not Supported Dataset!")
-        
-        assert len(labels)==len(images)
-        
-        print("\n The training set's dimension: {}x{}x{}x{}".format(images.shape[0], images.shape[1], images.shape[2], images.shape[3]))
-                
-        print("\r Range of unnormalized labels: ({},{})".format(np.min(labels), np.max(labels)))
-        
-        labels_norm = self.fn_normalize_labels(labels)
-        
-        print("\r Range of normalized labels: ({},{})".format(np.min(labels_norm), np.max(labels_norm)))
-        
-        return images, labels, labels_norm
-    
-    ## load the evaluation data
+            transformed = self.qt.transform(normalized)
+
+        return transformed.reshape(original_shape)
+
+    def inverse_transform(self, transformed_sequences):
+        """
+        Transform back to original scale
+        Args:
+            transformed_sequences: shape (N, D) or (D,) array
+        Returns:
+            Original scale sequences in same shape
+        """
+        original_shape = transformed_sequences.shape
+        values = transformed_sequences.reshape(-1, 1)
+
+        if self.output_distribution == "normal":
+            min_val = self.qt.transform(np.array([[0]]))
+            max_val = self.qt.transform(np.array([[1]]))
+            values = values * (max_val - min_val) + min_val
+
+        original = self.qt.inverse_transform(values)
+        return original.reshape(original_shape) * self.max_power
+
+    def save(self, filepath):
+        save_dict = {
+            "transformer": self.qt,
+            "max_power": self.max_power,
+            "output_distribution": self.output_distribution,
+        }
+        joblib.dump(save_dict, filepath)
+
+    @classmethod
+    def load(cls, filepath):
+        save_dict = joblib.load(filepath)
+        transformer = cls(output_distribution=save_dict["output_distribution"])
+        transformer.qt = save_dict["transformer"]
+        transformer.max_power = save_dict["max_power"]
+        return transformer
+
+
+class PowerSeqDataset(torch.utils.data.Dataset):
+    """
+    Dataset for loading optical design images and corresponding power sequences.
+    This dataset is specifically designed for the Sliced-CCDM model.
+    """
+
+    def __init__(
+        self,
+        design_folder,
+        power_path,
+        power_transformer=None,
+        transform=T.ToTensor(),
+        normalize_design=True,
+        return_raw_power=False,
+    ):
+        self.design_folder = design_folder
+        # (N, vector_dim) power sequences
+        self.power_data = np.loadtxt(power_path, delimiter=",", skiprows=1)
+        self.transform = transform
+        self.normalize_design = normalize_design
+        self.power_transformer = power_transformer
+        self.return_raw_power = return_raw_power
+        self.max_power = np.max(self.power_data)
+        self.data_name = "power_vector"  # For compatibility with other code
+
+        self.samples = []
+        self.labels = []  # Store power sequences
+        self.original_indices = []  # Store original indices
+
+        # Load all designs
+        self.designs = sorted(
+            [f for f in os.listdir(design_folder) if f.endswith(".tiff")],
+            key=lambda x: int(x.split(".")[0]),
+        )
+
+        # integrity check
+        if len(self.designs) != len(self.power_data):
+            raise ValueError(
+                f"Number of design files ({len(self.designs)}) does not match number of power sequences ({len(self.power_data)})"
+            )
+
+        # Create dataset
+        for idx, design_file in enumerate(self.designs):
+            # Load and process design image
+            design_path = os.path.join(self.design_folder, design_file)
+            design_sample = Image.open(design_path).convert("L")
+            design_sample = self.transform(design_sample)
+
+            if self.normalize_design:
+                design_sample = (design_sample - 0.5) / 0.5
+
+            # Get power sequence
+            power_sequence = self.power_data[idx, :]
+
+            if self.return_raw_power is True:
+                pass  # Return raw power sequence (0 ~ 240000)
+            elif self.power_transformer is not None:
+                power_sequence = self.power_transformer.transform(power_sequence)
+            else:
+                power_sequence = (
+                    power_sequence / self.max_power
+                )  # Normalize by max power
+
+            self.samples.append(
+                (design_sample, torch.from_numpy(power_sequence.astype(np.float32)))
+            )
+            self.labels.append(power_sequence)
+            self.original_indices.append(idx)
+
+        self.labels = np.array(self.labels)  # (N, D)
+        self.original_indices = np.array(self.original_indices)  # (N,)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        design, power_sequence = self.samples[idx]
+        # Convert to consistent format for training
+        return {"design": design, "labels": power_sequence}
+
+    def sample_sequences(self, num_samples):
+        """Sample power sequences for visualization"""
+        base_indices = np.random.choice(len(self.labels), size=num_samples)
+        base_sequences = self.labels[base_indices]
+        noise = np.random.uniform(-0.1, 0.1, size=base_sequences.shape)
+        sampled = np.clip(base_sequences + noise, 0, 1)
+        return torch.from_numpy(sampled).float()
+
+    def get_sequences(self):
+        return torch.from_numpy(self.labels).float()
+
+    def iter_sequences(self, batch_size=1000):
+        for start_idx in range(0, len(self.labels), batch_size):
+            end_idx = min(start_idx + batch_size, len(self.labels))
+            batch_indices = self.original_indices[start_idx:end_idx]
+            batch_labels = self.labels[start_idx:end_idx]
+            yield torch.from_numpy(batch_labels).float(), batch_indices
+
     def load_evaluation_data(self):
-        if self.data_name == "RC-49":
-            images = self.images_all
-            labels = self.labels_all
-            ## Extract a subset from the entire dataset.
-            indx = np.where((labels>self.min_label)*(labels<self.max_label)==True)[0]
-            labels = labels[indx]
-            images = images[indx]
-            
-            eval_labels = np.sort(np.array(list(set(labels))))
-            
-        elif self.data_name in ["UTKFace", "Cell200"]:
-            ## Extract a subset from the entire dataset.
-            images = []
-            labels = []
-            selected_labels = np.arange(self.min_label, self.max_label+1)
-            for i in range(len(selected_labels)):
-                curr_label = selected_labels[i]
-                index_curr_label = np.where(self.labels_all==curr_label)[0]
-                images.append(self.images_all[index_curr_label])
-                labels.append(self.labels_all[index_curr_label])
-            # for i
-            images = np.concatenate(images, axis=0)
-            labels = np.concatenate(labels)
-            
-            eval_labels = np.arange(self.min_label, self.max_label+1)
-        
-        elif self.data_name == "SteeringAngle":
-            indx = np.where((self.labels_all>self.min_label)*(self.labels_all<self.max_label)==True)[0]
-            labels = self.labels_all[indx]
-            images = self.images_all[indx]
-             
-            num_eval_labels = 2000
-            eval_labels = np.linspace(np.min(labels), np.max(labels), num_eval_labels)
-            
-        else:
-            raise ValueError("Not Supported Dataset!")
-        
-        print("\n The evaluation set's dimension: {}x{}x{}x{}".format(images.shape[0], images.shape[1], images.shape[2], images.shape[3]))
-        
+        """Return all data for evaluation purposes"""
+        # Extract images and labels for evaluation
+        images = np.array([sample[0].numpy() for sample in self.samples])
+        labels = self.labels
+        eval_labels = np.unique(labels, axis=0)
+
         return images, labels, eval_labels
-    
-            
-            
-    ## normalize labels into [0,1]
-    def fn_normalize_labels(self, input):
-        if self.data_name == "SteeringAngle":
-            output = input + np.abs(self.min_label_before_shift)
-            output = output / self.max_label_after_shift
-        else:
-            output = input/self.max_label
-        assert output.min()>=0 and output.max()<=1.0
-        return output
-    
-    ## de-normalize labels to their original scale
-    def fn_denormalize_labels(self, input):
-        if self.data_name == "SteeringAngle":
-            output = input*self.max_label_after_shift - np.abs(self.min_label_before_shift)
-        else:
-            if isinstance(input, np.ndarray):
-                output = (input*self.max_label).astype(int)
-            elif torch.is_tensor(input):
-                output = (input*self.max_label).type(torch.int)
-            else:
-                output = int(input*self.max_label)
-        return output
+
+    def load_train_data(self):
+        """Return training data"""
+        # Extract images and labels for training
+        images = np.array([sample[0].numpy() for sample in self.samples])
+        labels = self.labels
+        # normalized labels are the same as labels in this case
+        return images, labels, labels
+
+    def fn_normalize_labels(self, input_labels):
+        """
+        Normalize labels into [0,1] range.
+        For compatibility with the rest of the codebase.
+
+        Args:
+            input_labels: Input labels to normalize
+
+        Returns:
+            Normalized labels
+        """
+        # Input is already normalized, so return as is
+        return input_labels
+
+    def fn_denormalize_labels(self, input_labels):
+        """
+        Denormalize labels back to original scale.
+        For compatibility with the rest of the codebase.
+
+        Args:
+            input_labels: Normalized labels
+
+        Returns:
+            Original scale labels
+        """
+        # For compatibility, we would use the power transformer here
+        # But since we're already working with normalized values, we return as is
+        return input_labels
 
 
+# Factory function to create the appropriate dataset
+def create_dataset(dataset_type, **kwargs):
+    """
+    Factory function to create the dataset based on the dataset type
 
-# example
-if __name__ == "__main__":
-    file_path = 'C:/Users/DX/BaiduSyncdisk/Baidu_WD/datasets/CCGM_or_regression/RC-49' 
-    handler = LoadDataSet(data_name="RC-49", data_path=file_path, min_label=0, max_label=90, img_size=64, max_num_img_per_label=25, num_img_per_label_after_replica=0)
-    
-    # 读取并输出数据
-    data = handler.load_train_data()
-    
-    data2 = handler.load_evaluation_data()
-    
+    Args:
+        dataset_type: Type of dataset to create
+        **kwargs: Additional arguments for the dataset
+
+    Returns:
+        Created dataset instance
+    """
+    if dataset_type == "power_vector":
+        return PowerSeqDataset(**kwargs)
+    else:
+        raise ValueError(f"Unknown dataset type: {dataset_type}")
