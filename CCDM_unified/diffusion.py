@@ -523,18 +523,25 @@ class GaussianDiffusion(nn.Module):
     ):
         """
         Modified p_losses to support various vicinal loss types including Sliced variants
+        for multi-dimensional labels.
 
         Parameters:
-        - All original parameters
+        - x_start: Starting images [B, C, H, W]
+        - t: Timesteps [B]
+        - labels: Continuous labels [B, D] where D is the dimensionality of labels
+        - labels_emb: Embedded labels from label_embedding network
+        - noise: Optional pre-defined noise
+        - vicinal_weights: Optional pre-defined vicinal weights
         - kwargs: Additional parameters including vicinity_type, kappa, vector_type, etc.
+
+        Returns:
+        - loss: Computed loss value
         """
         vicinity_type = kwargs.get("vicinity_type", "shv")  # shv, ssv, hv, sv
         kappa = kwargs.get("kappa", 0.01)
-        vector_type = kwargs.get(
-            "vector_type", "gaussian"
-        )  # gaussian, rademacher, sphere
+        vector_type = kwargs.get("vector_type", "gaussian")
         num_projections = kwargs.get("num_projections", 1)
-        distance_type = kwargs.get("distance_type", "l2")  # l2, l1, cosine
+        distance = kwargs.get("distance", "l2")  # l2, l1, cosine
 
         b, c, h, w = x_start.shape
 
@@ -544,12 +551,13 @@ class GaussianDiffusion(nn.Module):
 
         # Use y dependent covariance matrix or not
         if self.use_Hy:
-            noise = default(
-                noise,
-                lambda: torch.randn_like(x_start)
-                * torch.sqrt(self.convert_y_to_cov(labels)),
-            )
-            noise[null_indx] = torch.randn_like(x_start[null_indx])
+            # Generate noise based on y-dependent covariance
+            if noise is None:
+                Hy_sqrt = torch.sqrt(self.convert_y_to_cov(labels))
+                noise = torch.randn_like(x_start) * Hy_sqrt
+                # For null indices, use standard normal
+                if len(null_indx) > 0:
+                    noise[null_indx] = torch.randn_like(x_start[null_indx])
         else:
             noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -561,6 +569,7 @@ class GaussianDiffusion(nn.Module):
             x=x, timesteps=t, labels_emb=labels_emb, keep_mask=keep_mask
         )
 
+        # Determine target based on objective
         if self.objective == "pred_noise":
             target = noise
         elif self.objective == "pred_x0":
@@ -571,97 +580,168 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f"unknown objective {self.objective}")
 
+        # Calculate base MSE loss
         loss = F.mse_loss(model_out, target, reduction="none")
+
+        # Apply y-dependent weighting if using Hy
         if self.use_Hy:
             loss_divisor = self.convert_y_to_cov(labels)
-            loss_divisor[null_indx] = torch.ones_like(loss_divisor[null_indx])
+            if len(null_indx) > 0:
+                loss_divisor[null_indx] = torch.ones_like(loss_divisor[null_indx])
             loss = loss / loss_divisor
+
+        # Reduce across spatial dimensions
         loss = reduce(loss, "b ... -> b (...)", "mean")
 
+        # Apply timestep weighting
         loss = loss * extract(self.loss_weight, t, loss.shape)
 
         # Apply vicinal weights based on vicinity type
         if vicinal_weights is not None:
+            # Reshape loss to [B]
             loss = torch.sum(loss, dim=1)
 
             # For multi-dimensional labels
-            if vicinity_type in ["shv", "ssv"] and labels.dim() > 1:
+            if (
+                vicinity_type in ["shv", "ssv"]
+                and labels.dim() > 1
+                and labels.shape[1] > 1
+            ):
                 device = labels.device
                 dim = labels.shape[1]
 
+                # Initialize batch weights
+                batch_weights = torch.zeros_like(vicinal_weights)
+
+                # Generate or retrieve random projection vectors
+                if "cached_vectors" in kwargs and kwargs["cached_vectors"] is not None:
+                    v = kwargs["cached_vectors"]
+                else:
+                    v = generate_random_vectors(
+                        vector_type, dim, num_projections, device
+                    )
+
+                # Apply weights based on all projection vectors
+                for proj_idx in range(num_projections):
+                    # Project labels onto current random direction
+                    proj_vec = v[proj_idx : proj_idx + 1]
+
+                    # Normalize projection vector for numerical stability
+                    proj_vec_norm = F.normalize(proj_vec, dim=1)
+
+                    # Calculate projections for all labels at once
+                    all_projections = torch.matmul(labels, proj_vec_norm.t()).squeeze(
+                        -1
+                    )  # [B]
+
+                    # Calculate pairwise projection differences efficiently
+                    proj_diff_matrix = all_projections.unsqueeze(
+                        1
+                    ) - all_projections.unsqueeze(
+                        0
+                    )  # [B, B]
+
+                    if vicinity_type == "shv":  # Sliced Hard Vicinal
+                        # Calculate effective kappa based on projection vector norm
+                        effective_kappa = kappa * torch.norm(proj_vec)
+
+                        # Create mask for each sample
+                        in_vicinity_mask = (
+                            torch.abs(proj_diff_matrix) <= effective_kappa
+                        ).float()  # [B, B]
+
+                        # Update batch weights (sum over all labels that are in vicinity)
+                        batch_weights += in_vicinity_mask.sum(dim=1) / num_projections
+
+                    else:  # Sliced Soft Vicinal
+                        # Calculate nu parameter
+                        nu = 1.0 / (kappa**2)
+
+                        # Calculate soft weights
+                        soft_weights = torch.exp(-nu * proj_diff_matrix**2)  # [B, B]
+
+                        # Update batch weights (sum over weighted contributions)
+                        batch_weights += soft_weights.sum(dim=1) / num_projections
+
+                # Normalize batch weights
+                batch_weights = batch_weights / b  # Normalize by batch size
+
+                # Don't apply weighting on null inputs
+                if len(null_indx) > 0:
+                    batch_weights[null_indx] = 1.0
+
+                # Apply weights to loss
+                loss = torch.sum(batch_weights * loss) / (b * c * h * w)
+
+            elif vicinity_type in ["hv", "sv"]:  # Traditional Hard/Soft Vicinal
                 # Initialize weights
                 batch_weights = torch.zeros_like(vicinal_weights)
 
-                # Generate random projection vectors
-                v = generate_random_vectors(vector_type, dim, num_projections, device)
+                # Calculate pairwise distances efficiently
+                if distance == "l2":
+                    # L2 distance
+                    if labels.dim() > 1 and labels.shape[1] > 1:
+                        # Multi-dimensional case
+                        diff = labels.unsqueeze(1) - labels.unsqueeze(0)  # [B, B, D]
+                        pairwise_dist = torch.sqrt((diff**2).sum(dim=2))  # [B, B]
+                    else:
+                        # 1D case
+                        diff = labels.unsqueeze(1) - labels.unsqueeze(0)  # [B, B]
+                        pairwise_dist = torch.abs(diff)  # [B, B]
 
-                for proj_idx in range(num_projections):
-                    # Project labels onto random direction
-                    projected_labels = compute_projection(
-                        labels, v[proj_idx : proj_idx + 1]
-                    )
+                elif distance == "l1":
+                    # L1 distance
+                    diff = labels.unsqueeze(1) - labels.unsqueeze(
+                        0
+                    )  # [B, B, D] or [B, B]
+                    if diff.dim() > 2:
+                        pairwise_dist = torch.abs(diff).sum(dim=2)  # [B, B]
+                    else:
+                        pairwise_dist = torch.abs(diff)  # [B, B]
 
-                    # For each pair of samples
-                    for i in range(b):
-                        for j in range(b):
-                            if vicinity_type == "shv":  # Sliced Hard Vicinal
-                                proj_diff = torch.abs(
-                                    projected_labels[i] - projected_labels[j]
-                                )
-                                if proj_diff <= kappa * torch.norm(v[proj_idx]):
-                                    batch_weights[i] += 1.0 / num_projections
-                            else:  # Sliced Soft Vicinal
-                                nu = 1.0 / (kappa**2)
-                                proj_diff = projected_labels[i] - projected_labels[j]
-                                batch_weights[i] += (
-                                    torch.exp(-nu * proj_diff**2) / num_projections
-                                )
+                elif distance == "cosine":
+                    # Cosine distance
+                    if labels.dim() > 1 and labels.shape[1] > 1:
+                        # Normalize labels
+                        norm_labels = F.normalize(labels, dim=1)
+                        # Calculate cosine similarity
+                        cos_sim = torch.matmul(norm_labels, norm_labels.t())  # [B, B]
+                        # Convert to distance (1 - similarity)
+                        pairwise_dist = 1 - cos_sim  # [B, B]
+                    else:
+                        # For 1D labels, cosine distance doesn't make sense
+                        # Fallback to L2
+                        diff = labels.unsqueeze(1) - labels.unsqueeze(0)
+                        pairwise_dist = torch.abs(diff)
 
-                # Don't apply weighting on null inputs
-                batch_weights[null_indx] = 1.0
+                # Apply vicinity weights
+                if vicinity_type == "hv":  # Hard Vicinal
+                    # Create binary mask for vicinity
+                    vicinity_mask = (pairwise_dist <= kappa).float()  # [B, B]
+                    # Sum over all labels in vicinity for each sample
+                    batch_weights = vicinity_mask.sum(dim=1)
 
-                # Apply weights
-                loss = torch.sum(batch_weights.view(-1) * loss.view(-1)) / (
-                    b * c * h * w
-                )
-
-            elif vicinity_type in [
-                "hv",
-                "sv",
-            ]:  # Traditional Hard/Soft Vicinal for all dimensions
-                # For Hard Vicinal (HV-NLL)
-                if vicinity_type == "hv":
-                    batch_weights = torch.zeros_like(vicinal_weights)
-                    for i in range(b):
-                        for j in range(b):
-                            if (
-                                compute_distance(labels[i], labels[j], distance_type)
-                                <= kappa
-                            ):
-                                batch_weights[i] = 1.0
-
-                # For Soft Vicinal (SV-NLL)
-                else:  # sv
+                else:  # Soft Vicinal
+                    # Calculate soft weights
                     nu = 1.0 / (kappa**2)
-                    batch_weights = torch.zeros_like(vicinal_weights)
-                    for i in range(b):
-                        for j in range(b):
-                            dist = compute_distance(labels[i], labels[j], distance_type)
-                            batch_weights[i] = torch.exp(-nu * dist**2)
+                    batch_weights = torch.exp(-nu * pairwise_dist**2).sum(dim=1)
+
+                # Normalize
+                batch_weights = batch_weights / b
 
                 # Don't apply weighting on null inputs
-                batch_weights[null_indx] = 1.0
+                if len(null_indx) > 0:
+                    batch_weights[null_indx] = 1.0
 
-                # Apply weights
-                loss = torch.sum(batch_weights.view(-1) * loss.view(-1)) / (
-                    b * c * h * w
-                )
+                # Apply weights to loss
+                loss = torch.sum(batch_weights * loss) / (b * c * h * w)
 
             else:  # Use provided vicinal weights (original implementation)
-                vicinal_weights[null_indx] = 1.0  # Don't apply weighting on null inputs
-                loss = torch.sum(vicinal_weights.view(-1) * loss.view(-1)) / (
-                    b * c * h * w
-                )
+                if len(null_indx) > 0:
+                    vicinal_weights[null_indx] = (
+                        1.0  # Don't apply weighting on null inputs
+                    )
+                loss = torch.sum(vicinal_weights * loss) / (b * c * h * w)
         else:
             loss = loss.mean()
 
