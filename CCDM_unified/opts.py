@@ -9,8 +9,8 @@ def parse_opts():
     parser.add_argument(
         "--data_name",
         type=str,
-        default="UTKFace",
-        choices=["UTKFace", "RC-49", "Cell200", "SteeringAngle"],
+        default="power_vector",
+        choices=["power_vector", "UTKFace", "RC-49", "Cell200", "SteeringAngle"],
     )
     parser.add_argument("--data_path", type=str, default="./")
     parser.add_argument("--torch_model_path", type=str, default="None")
@@ -88,7 +88,7 @@ def parse_opts():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="default",
+        default="power_vector",
         choices=["default", "power_vector"],
         help="Dataset type to use",
     )
@@ -103,6 +103,13 @@ def parse_opts():
         type=str,
         default="./data/image/",
         help="Path to design image folder",
+    )
+    parser.add_argument(
+        "--dim_combination",
+        type=str,
+        default="attention",
+        choices=["mean", "weighted", "attention", "cross"],
+        help="How to combine embeddings from different label dimensions",
     )
 
     """ Dataset """
