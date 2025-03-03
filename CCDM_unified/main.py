@@ -27,6 +27,7 @@ import timeit
 
 from models import Unet
 from models.vit import ViT
+from dataset import PowerSeqDataset, PowerTransformer
 from dataset import LoadDataSet
 from label_embedding import LabelEmbed
 from diffusion import GaussianDiffusion
@@ -88,8 +89,6 @@ os.makedirs(save_results_folder, exist_ok=True)
 #######################################################################################
 
 if args.dataset == "power_vector":
-    from utils import PowerSeqDataset, PowerTransformer
-
     # initialize Power transformer and train
     power_transformer = PowerTransformer()
 
@@ -105,7 +104,7 @@ if args.dataset == "power_vector":
     train_data = []
     for i in range(len(dataset)):
         batch = dataset[i]
-        train_data.append((batch["design"], batch["labels"].squeeze(0)))
+        train_data.append((batch["design"], batch["labels"]))
 
     # separate images and labels
     train_images = torch.stack([item[0] for item in train_data]).numpy()
@@ -119,7 +118,8 @@ if args.dataset == "power_vector":
     args.label_dim = train_labels.shape[1]
 
 else:
-    # keep original dataset
+    # Keep this as fallback for any legacy dataset handlers
+    # (though we should eventually phase this out)
     dataset = LoadDataSet(
         data_name=args.data_name,
         data_path=args.data_path,
@@ -136,9 +136,14 @@ else:
     # single-dim label
     args.label_dim = 1
 
-
+# Modify the hyperparameter calculation section to handle multi-dimensional labels
 if args.kernel_sigma < 0:
-    std_label = np.std(train_labels_norm)
+    if args.label_dim > 1:
+        # For multi-dimensional labels, compute std per dimension and average
+        std_label = np.mean(np.std(train_labels_norm, axis=0))
+    else:
+        std_label = np.std(train_labels_norm)
+
     args.kernel_sigma = 1.06 * std_label * (len(train_labels_norm)) ** (-1 / 5)
 
     print("\n Use rule-of-thumb formula to compute kernel_sigma >>>")
@@ -147,93 +152,129 @@ if args.kernel_sigma < 0:
             len(train_labels_norm), std_label, args.kernel_sigma
         )
     )
-##end if
 
 if args.kappa < 0:
-    n_unique = len(unique_labels_norm)
+    if args.hyperparameter == "rule_of_thumb":
+        # Rule of thumb method
+        if args.label_dim > 1:
+            # For multi-dimensional labels
+            # Sort unique labels and compute pairwise distances
+            n_unique = len(unique_labels_norm)
 
-    diff_list = []
-    for i in range(1, n_unique):
-        diff_list.append(unique_labels_norm[i] - unique_labels_norm[i - 1])
-    kappa_base = np.abs(args.kappa) * np.max(np.array(diff_list))
+            if n_unique > 1:
+                diff_list = []
+                for i in range(1, n_unique):
+                    # Compute distance between consecutive labels
+                    if args.distance == "l1":
+                        diff = np.sum(
+                            np.abs(unique_labels_norm[i] - unique_labels_norm[i - 1])
+                        )
+                    elif args.distance == "cosine":
+                        norm1 = np.linalg.norm(unique_labels_norm[i])
+                        norm2 = np.linalg.norm(unique_labels_norm[i - 1])
+                        dot_product = np.dot(
+                            unique_labels_norm[i], unique_labels_norm[i - 1]
+                        )
+                        diff = (
+                            1 - dot_product / (norm1 * norm2)
+                            if norm1 > 0 and norm2 > 0
+                            else 1
+                        )
+                    else:  # default to l2
+                        diff = np.linalg.norm(
+                            unique_labels_norm[i] - unique_labels_norm[i - 1]
+                        )
+                    diff_list.append(diff)
 
-    if args.threshold_type == "hard":
-        args.kappa = kappa_base
-    else:
-        args.kappa = 1 / kappa_base**2
-##end if
+                kappa_base = np.max(np.array(diff_list))
+            else:
+                # Fallback for single unique label
+                kappa_base = 0.01
+        else:
+            # Original logic for scalar labels
+            n_unique = len(unique_labels_norm)
+            diff_list = []
+            for i in range(1, n_unique):
+                diff_list.append(unique_labels_norm[i] - unique_labels_norm[i - 1])
+            kappa_base = np.max(np.array(diff_list))
 
-print("\r Kappa:{:.4f}".format(args.kappa))
+        if args.threshold_type == "hard" or args.vicinity_type in ["hv", "shv"]:
+            args.kappa = np.abs(args.kappa) * kappa_base
+        else:
+            args.kappa = 1 / (np.abs(args.kappa) * kappa_base) ** 2
+
+    elif args.hyperparameter == "percentile":
+        # Percentile method
+        # Calculate pairwise distances between all labels
+        distances = []
+        for i in range(len(train_labels_norm)):
+            for j in range(i + 1, len(train_labels_norm)):
+                if args.distance == "l1":
+                    dist = np.sum(np.abs(train_labels_norm[i] - train_labels_norm[j]))
+                elif args.distance == "cosine":
+                    norm1 = np.linalg.norm(train_labels_norm[i])
+                    norm2 = np.linalg.norm(train_labels_norm[j])
+                    dot_product = np.dot(train_labels_norm[i], train_labels_norm[j])
+                    dist = (
+                        1 - dot_product / (norm1 * norm2)
+                        if norm1 > 0 and norm2 > 0
+                        else 1
+                    )
+                else:  # default to l2
+                    dist = np.linalg.norm(train_labels_norm[i] - train_labels_norm[j])
+                distances.append(dist)
+
+        # Set kappa to the percentile of distances
+        args.kappa = np.percentile(distances, args.percentile)
+
+        # Adjust based on vicinity type
+        if args.threshold_type == "soft" or args.vicinity_type in ["sv", "ssv"]:
+            args.kappa = 1 / (args.kappa) ** 2
 
 
 #######################################################################################
 """                             label embedding method                              """
 #######################################################################################
 
-if args.data_name == "UTKFace":
-    dataset_embed = LoadDataSet(
-        data_name=args.data_name,
-        data_path=args.data_path,
-        min_label=args.min_label,
-        max_label=args.max_label,
-        img_size=args.image_size,
-        max_num_img_per_label=1e30,
-        num_img_per_label_after_replica=200,
-    )
-elif args.data_name == "Cell200":
-    dataset_embed = LoadDataSet(
-        data_name=args.data_name,
-        data_path=args.data_path,
-        min_label=args.min_label,
-        max_label=args.max_label,
-        img_size=args.image_size,
-        max_num_img_per_label=args.max_num_img_per_label,
-        num_img_per_label_after_replica=0,
-    )
-else:
-    dataset_embed = LoadDataSet(
-        data_name=args.data_name,
-        data_path=args.data_path,
-        min_label=args.min_label,
-        max_label=args.max_label,
-        img_size=args.image_size,
-        max_num_img_per_label=1e30,
-        num_img_per_label_after_replica=0,
-    )
-
+# Initialize label embedding based on the selected type
 if args.label_embed == "ccdm1":
     label_embedding = LabelEmbed(
-        dataset=dataset_embed,
+        dataset=dataset,
         path_y2h=path_to_output + "/model_y2h",
-        y2h_type="sinusoidal",
+        y2h_type=args.y2h_embed_type,
         h_dim=args.dim_embed,
         nc=args.num_channels,
         label_dim=args.label_dim,
+        dim_combination=args.dim_combination,
     )
 elif args.label_embed == "ccdm2":
     label_embedding = LabelEmbed(
-        dataset=dataset_embed,
+        dataset=dataset,
         path_y2h=path_to_output + "/model_y2h",
         path_y2cov=path_to_output + "/model_y2cov",
-        y2h_type="resnet",
-        y2cov_type="resnet",
+        y2h_type=args.y2h_embed_type,
+        y2cov_type=args.y2cov_embed_type,
         h_dim=args.dim_embed,
         cov_dim=args.image_size**2 * args.num_channels,
         nc=args.num_channels,
         label_dim=args.label_dim,
+        dim_combination=args.dim_combination,
     )
 else:  # random
     label_embedding = LabelEmbed(
-        dataset=dataset_embed,
+        dataset=dataset,
         path_y2h=path_to_output + "/model_y2h",
         y2h_type="gaussian",
         h_dim=args.dim_embed,
         nc=args.num_channels,
         label_dim=args.label_dim,
+        dim_combination=args.dim_combination,
     )
 
 fn_y2h = label_embedding.fn_y2h
-fn_y2cov = label_embedding.fn_y2cov
+fn_y2cov = getattr(
+    label_embedding, "fn_y2cov", None
+)  # Use getattr to avoid attribute error
 
 
 #######################################################################################
@@ -272,6 +313,7 @@ else:  # vit
         patch_size=2,  # 2x2 patches
         num_blocks=8,  # 8 transformer blocks
     )
+
 model = nn.DataParallel(model)
 print("\r model size:", get_parameter_number(model))
 
@@ -308,8 +350,7 @@ for i in range(n_row):
 y_visual = torch.from_numpy(y_visual).type(torch.float).view(-1).cuda()
 print(y_visual)
 
-
-## for training
+# Update the vicinal parameters dict with all needed parameters
 vicinal_params = {
     "kernel_sigma": args.kernel_sigma,
     "kappa": args.kappa,
