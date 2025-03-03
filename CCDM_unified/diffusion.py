@@ -472,23 +472,6 @@ class GaussianDiffusion(nn.Module):
             rescaled_phi,
         )
 
-    # @torch.no_grad()
-    # def interpolate(self, x1, x2, labels_emb, t = None, lam = 0.5):
-    #     b, *_, device = *x1.shape, x1.device
-    #     t = default(t, self.num_timesteps - 1)
-
-    #     assert x1.shape == x2.shape
-
-    #     t_batched = torch.stack([torch.tensor(t, device = device)] * b)
-    #     xt1, xt2 = map(lambda x: self.q_sample(x, t = t_batched), (x1, x2))
-
-    #     img = (1 - lam) * xt1 + lam * xt2
-
-    #     for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
-    #         img, _ = self.p_sample(img, i, labels_emb)
-
-    #     return img
-
     # @autocast('cuda', enabled = False)
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -627,7 +610,7 @@ class GaussianDiffusion(nn.Module):
                     proj_vec = v[proj_idx : proj_idx + 1]
 
                     # Normalize projection vector for numerical stability
-                    proj_vec_norm = F.normalize(proj_vec, dim=1)
+                    proj_vec_norm = F.normalize(proj_vec, dim=1, eps=1e-8)
 
                     # Calculate projections for all labels at once
                     all_projections = torch.matmul(labels, proj_vec_norm.t()).squeeze(
@@ -643,7 +626,7 @@ class GaussianDiffusion(nn.Module):
 
                     if vicinity_type == "shv":  # Sliced Hard Vicinal
                         # Calculate effective kappa based on projection vector norm
-                        effective_kappa = kappa * torch.norm(proj_vec)
+                        effective_kappa = kappa * torch.norm(proj_vec) + 1e-8
 
                         # Create mask for each sample
                         in_vicinity_mask = (
