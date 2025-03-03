@@ -520,25 +520,6 @@ fake_labels = np.concatenate(fake_labels)
 print("Sampling finished; Time elapses: {}s".format(total_sample_time))
 
 
-### dump for computing NIQE
-if args.dump_fake_for_NIQE:
-    print("\n Dumping fake images for NIQE...")
-    if args.niqe_dump_path == "None":
-        dump_fake_images_folder = save_setting_folder + "/fake_images"
-    else:
-        dump_fake_images_folder = args.niqe_dump_path + "/fake_images"
-    os.makedirs(dump_fake_images_folder, exist_ok=True)
-    for i in tqdm(range(len(fake_images))):
-        label_i = fake_labels[i]
-        filename_i = dump_fake_images_folder + "/{}_{:.1f}.png".format(i, label_i)
-        os.makedirs(os.path.dirname(filename_i), exist_ok=True)
-        image_i = fake_images[i]
-        image_i_pil = Image.fromarray(image_i.transpose(1, 2, 0))
-        image_i_pil.save(filename_i)
-    # end for i
-    sys.exit()
-
-
 print(
     "\n==================================================================================================="
 )
