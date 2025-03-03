@@ -785,7 +785,7 @@ class Trainer(object):
         fn_y2h,
         batch_size,
         denorm=True,
-        to_numpy=False,
+        to_numpy=True,
         verbose=False,
         sampler="ddpm",
         cond_scale=6.0,
@@ -869,40 +869,3 @@ class Trainer(object):
         return fake_images, given_labels
 
     ## end def
-
-    # def generate_intermediate_gifs(self, path_to_save, given_labels, fn_y2h, fps=20, sampler="ddpm", cond_scale=6.0, sample_timesteps=1000, ddim_eta = 0):
-    #     """
-    #     Generate intermediate noisy images in the GIF format
-    #     :given_labels: normalized labels
-    #     :fn_y2h: label embedding function
-    #     """
-    #     accelerator = self.accelerator
-    #     device = accelerator.device
-
-    #     assert given_labels.min()>=0 and given_labels.max()<=1.0
-    #     nfake = len(given_labels)
-
-    #     self.ema.ema_model.eval()
-    #     with torch.inference_mode():
-    #         if sampler == "ddpm":
-    #             _, frames = self.ema.ema_model.sample(
-    #                                 labels_emb = fn_y2h(given_labels),
-    #                                 labels = given_labels,
-    #                                 cond_scale = cond_scale,
-    #                                 save_intermediate=True
-    #                                 )
-    #         elif sampler == "ddim":
-    #             _, frames = self.ema.ema_model.ddim_sample(
-    #                                 labels_emb = fn_y2h(given_labels),
-    #                                 labels = given_labels,
-    #                                 shape = (given_labels.shape[0], self.channels, self.image_size, self.image_size),
-    #                                 cond_scale = cond_scale,
-    #                                 # preset_sampling_timesteps = sample_timesteps,
-    #                                 # preset_ddim_sampling_eta = ddim_eta, # 1 for ddpm, 0 for ddim
-    #                                 save_intermediate=True
-    #                                 )
-
-    #     clip = ImageSequenceClip(list(frames), fps=fps)
-    #     clip.write_gif(path_to_save, fps=fps)
-
-    # ## end def
