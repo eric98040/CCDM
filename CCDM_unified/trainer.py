@@ -97,7 +97,6 @@ class Trainer(object):
         # vicinal params
         self.kernel_sigma = vicinal_params["kernel_sigma"]
         self.kappa = vicinal_params["kappa"]
-        self.threshold_type = vicinal_params["threshold_type"]
         self.nonzero_soft_weight_threshold = vicinal_params[
             "nonzero_soft_weight_threshold"
         ]
@@ -207,13 +206,14 @@ class Trainer(object):
 
                 kappa_base = max(diff_list)
 
-                if self.vicinity_type in ["hv", "shv"]:
+                is_hard_vicinity = self.vicinity_type in ["hv", "shv"]
+                if is_hard_vicinity:
                     kappa = kappa_base
                 else:  # sv, ssv
                     kappa = 1 / kappa_base**2
             else:
                 # Fallback for single unique label case
-                kappa = 0.01 if self.vicinity_type in ["hv", "shv"] else 10000
+                kappa = 0.01 if is_hard_vicinity else 10000
 
         else:  # percentile method
             # Calculate pairwise distances between all labels
