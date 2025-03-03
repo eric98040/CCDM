@@ -177,8 +177,12 @@ class Trainer(object):
         """
         if self.hyperparameter == "rule_of_thumb":
             # Compute sigma_delta using rule of thumb formula
-            std_label = np.std(self.train_labels, axis=0)
-            sigma_delta = 1.06 * std_label * (len(self.train_labels)) ** (-1 / 5)
+            if len(self.train_labels.shape) > 1 and self.train_labels.shape[1] > 1:
+                std_label = np.std(self.train_labels, axis=0)
+                sigma_delta = 1.06 * std_label * (len(self.train_labels)) ** (-1 / 5)
+            else:
+                std_label = np.std(self.train_labels)
+                sigma_delta = 1.06 * std_label * (len(self.train_labels)) ** (-1 / 5)
 
             # Compute kappa based on unique labels
             unique_labels = np.unique(self.train_labels, axis=0)
