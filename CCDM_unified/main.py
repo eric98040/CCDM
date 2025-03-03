@@ -201,62 +201,37 @@ else:
         num_img_per_label_after_replica=0,
     )
 
-if args.label_dim > 1:
-    # multi-dim label
-    if args.label_embed == "ccdm1":
-        label_embedding = LabelEmbed(
-            dataset=dataset_embed,
-            path_y2h=path_to_output + "/model_y2h",
-            y2h_type="sinusoidal",
-            h_dim=args.dim_embed,
-            nc=args.num_channels,
-        )
-    elif args.label_embed == "ccdm2":
-        label_embedding = LabelEmbed(
-            dataset=dataset_embed,
-            path_y2h=path_to_output + "/model_y2h",
-            path_y2cov=path_to_output + "/model_y2cov",
-            y2h_type="resnet",
-            y2cov_type="resnet",
-            h_dim=args.dim_embed,
-            cov_dim=args.image_size**2 * args.num_channels,
-            nc=args.num_channels,
-        )
-    else:  # random
-        label_embedding = LabelEmbed(
-            dataset=dataset_embed,
-            path_y2h=path_to_output + "/model_y2h",
-            y2h_type="gaussian",
-            h_dim=args.dim_embed,
-            nc=args.num_channels,
-        )
-else:
-    # original single-dim label
-    if (
-        args.y2h_embed_type == "sinusoidal"
-        and args.y2cov_embed_type == "None"
-        and not args.use_Hy
-    ):
-        # CCDM1
-        label_embedding = LabelEmbed(
-            dataset=dataset_embed,
-            path_y2h=path_to_output + "/model_y2h",
-            y2h_type=args.y2h_embed_type,
-            h_dim=args.dim_embed,
-            nc=args.num_channels,
-        )
-    else:
-        # CCDM2
-        label_embedding = LabelEmbed(
-            dataset=dataset_embed,
-            path_y2h=path_to_output + "/model_y2h",
-            path_y2cov=path_to_output + "/model_y2cov",
-            y2h_type=args.y2h_embed_type,
-            y2cov_type=args.y2cov_embed_type,
-            h_dim=args.dim_embed,
-            cov_dim=args.image_size**2 * args.num_channels,
-            nc=args.num_channels,
-        )
+if args.label_embed == "ccdm1":
+    label_embedding = LabelEmbed(
+        dataset=dataset_embed,
+        path_y2h=path_to_output + "/model_y2h",
+        y2h_type="sinusoidal",
+        h_dim=args.dim_embed,
+        nc=args.num_channels,
+        label_dim=args.label_dim,
+    )
+elif args.label_embed == "ccdm2":
+    label_embedding = LabelEmbed(
+        dataset=dataset_embed,
+        path_y2h=path_to_output + "/model_y2h",
+        path_y2cov=path_to_output + "/model_y2cov",
+        y2h_type="resnet",
+        y2cov_type="resnet",
+        h_dim=args.dim_embed,
+        cov_dim=args.image_size**2 * args.num_channels,
+        nc=args.num_channels,
+        label_dim=args.label_dim,
+    )
+else:  # random
+    label_embedding = LabelEmbed(
+        dataset=dataset_embed,
+        path_y2h=path_to_output + "/model_y2h",
+        y2h_type="gaussian",
+        h_dim=args.dim_embed,
+        nc=args.num_channels,
+        label_dim=args.label_dim,
+    )
+
 fn_y2h = label_embedding.fn_y2h
 fn_y2cov = label_embedding.fn_y2cov
 
