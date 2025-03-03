@@ -15,6 +15,25 @@ from models import ResNet34_embed_y2h, model_y2h, ResNet34_embed_y2cov, model_y2
 from utils import IMGs_dataset
 
 
+def sinusoidal_embedding(labels, embed_dim, device):
+    """
+    Sinusoidal positional embedding for labels
+    """
+    max_period = 10000
+    labels = labels.view(len(labels))
+    half = embed_dim // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(start=0, end=half, dtype=torch.float32)
+        / half
+    ).to(device=device)
+    args = labels[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if embed_dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+
 class GaussianFourierProjection(nn.Module):
     """Gaussian random features for encoding time steps."""
 
@@ -158,7 +177,7 @@ class LabelEmbed:
 
             self.model_mlp_y2h = model_mlp_y2h
 
-            ##some simple test
+            # some simple test
             indx_tmp = np.arange(len(unique_labels_norm))
             np.random.shuffle(indx_tmp)
             indx_tmp = indx_tmp[:10]
@@ -190,7 +209,7 @@ class LabelEmbed:
             print("\n noisy labels vs reconstructed labels")
             print(results2)
 
-        ##end if
+        # end if
 
         if y2cov_type == "resnet":
 
@@ -289,7 +308,7 @@ class LabelEmbed:
 
             self.model_mlp_y2cov = model_mlp_y2cov
 
-            ##some simple test
+            # some simple test
             indx_tmp = np.arange(len(unique_labels_norm))
             np.random.shuffle(indx_tmp)
             indx_tmp = indx_tmp[:10]
@@ -321,9 +340,9 @@ class LabelEmbed:
             print("\n noisy labels vs reconstructed labels")
             print(results2)
 
-        ##end if
+        # end if
 
-    ## function for y2h
+    # function for y2h
     def fn_y2h(self, labels):
         embed_dim = self.h_dim
 
