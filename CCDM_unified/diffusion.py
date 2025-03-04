@@ -54,19 +54,27 @@ def cosine_beta_schedule(timesteps, s=0.008):
 
 def generate_random_vectors(vector_type, dim, n_vectors, device):
     """
-    Generate random vectors for projection
+    Generate random vectors for projection based on specified type
+
+    Args:
+        vector_type: Type of random vector ('gaussian', 'rademacher', 'sphere')
+        dim: Dimension of vectors
+        n_vectors: Number of vectors to generate
+        device: Device to place vectors on
+
+    Returns:
+        Random vectors of shape [n_vectors, dim]
     """
     if vector_type == "gaussian":
-        # Generate random Gaussian vectors
+        # Standard normal distribution
         return torch.randn(n_vectors, dim, device=device)
     elif vector_type == "rademacher":
-        # Generate random Rademacher vectors (±1)
+        # Random ±1 vectors
         return torch.randint(0, 2, (n_vectors, dim), device=device) * 2 - 1
     elif vector_type == "sphere":
-        # Generate random vectors on the unit sphere
+        # Unit vectors uniformly distributed on sphere
         vectors = torch.randn(n_vectors, dim, device=device)
-        vectors = F.normalize(vectors, dim=1)
-        return vectors
+        return F.normalize(vectors, dim=1)
     else:
         raise ValueError(f"Unknown vector type: {vector_type}")
 
@@ -721,13 +729,7 @@ class GaussianDiffusion(nn.Module):
                 # Apply weights to loss
                 loss = torch.sum(batch_weights * loss) / (b * c * h * w)
 
-            else:  # Use provided vicinal weights (original implementation)
-                if len(null_indx) > 0:
-                    vicinal_weights[null_indx] = (
-                        1.0  # Don't apply weighting on null inputs
-                    )
-                loss = torch.sum(vicinal_weights * loss) / (b * c * h * w)
-        else:
+        else:  # No vicinal weights provided
             loss = loss.mean()
 
         return loss
