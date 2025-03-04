@@ -256,7 +256,6 @@ class LabelEmbed:
         # Similar logic for y2cov if needed
         if y2cov_type == "resnet" and path_y2cov is not None:
             # Implementation similar to y2h but for covariance embedding
-            # ...
             os.makedirs(path_y2cov, exist_ok=True)
             
             ## Training setups
