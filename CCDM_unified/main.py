@@ -27,8 +27,9 @@ import timeit
 
 from models import Unet
 from models.vit import ViT
-from dataset import PowerSeqDataset, PowerTransformer
-from dataset import LoadDataSet
+from dataset import PowerSeqDataset  # , PowerTransformer
+
+# from dataset import LoadDataSet
 from label_embedding import LabelEmbed
 from diffusion import GaussianDiffusion
 from trainer import Trainer
@@ -90,13 +91,13 @@ os.makedirs(save_results_folder, exist_ok=True)
 
 if args.dataset == "power_vector":
     # initialize Power transformer and train
-    power_transformer = PowerTransformer()
+    # power_transformer = PowerTransformer()
 
     # load Power dataset
     dataset = PowerSeqDataset(
         design_folder=args.design_folder,
         power_path=args.power_data_path,
-        power_transformer=power_transformer,
+        power_transformer=None,
         normalize_design=True,
     )
 
@@ -152,13 +153,15 @@ if args.kernel_sigma < 0:
             len(train_labels_norm), std_label, args.kernel_sigma
         )
     )
+# 변수 설정
+is_hard_vicinity = args.vicinity_type in ["hv", "shv"]
 
+# kappa 계산 시 hard/soft 여부 결정
 if args.kappa < 0:
     if args.hyperparameter == "rule_of_thumb":
         # Rule of thumb method
         if args.label_dim > 1:
             # For multi-dimensional labels
-            # Sort unique labels and compute pairwise distances
             n_unique = len(unique_labels_norm)
 
             if n_unique > 1:
@@ -198,7 +201,6 @@ if args.kappa < 0:
                 diff_list.append(unique_labels_norm[i] - unique_labels_norm[i - 1])
             kappa_base = np.max(np.array(diff_list))
 
-        is_hard_vicinity = args.vicinity_type in ["hv", "shv"]
         if is_hard_vicinity:
             args.kappa = np.abs(args.kappa) * kappa_base
         else:
@@ -229,8 +231,23 @@ if args.kappa < 0:
         args.kappa = np.percentile(distances, args.percentile)
 
         # Adjust based on vicinity type
-        if args.threshold_type == "soft" or args.vicinity_type in ["sv", "ssv"]:
+        if not is_hard_vicinity:  # For soft vicinity
             args.kappa = 1 / (args.kappa) ** 2
+
+# Update the vicinal parameters dict with all needed parameters
+vicinal_params = {
+    "kernel_sigma": args.kernel_sigma,
+    "kappa": args.kappa,
+    "nonzero_soft_weight_threshold": args.nonzero_soft_weight_threshold,
+    "vicinity_type": args.vicinity_type,
+    "vector_type": args.vector_type,
+    "num_projections": args.num_projections,
+    "distance": args.distance,
+    "label_dim": args.label_dim,
+    "adaptive_slicing": args.adaptive_slicing,
+    "hyperparameter": args.hyperparameter,
+    "percentile": args.percentile,
+}
 
 
 #######################################################################################
@@ -352,21 +369,6 @@ for i in range(n_row):
 y_visual = torch.from_numpy(y_visual).type(torch.float).view(-1).cuda()
 print(y_visual)
 
-# Update the vicinal parameters dict with all needed parameters
-vicinal_params = {
-    "kernel_sigma": args.kernel_sigma,
-    "kappa": args.kappa,
-    "threshold_type": args.threshold_type,
-    "nonzero_soft_weight_threshold": args.nonzero_soft_weight_threshold,
-    "vicinity_type": args.vicinity_type,
-    "vector_type": args.vector_type,
-    "num_projections": args.num_projections,
-    "distance": args.distance,
-    "label_dim": args.label_dim,
-    "adaptive_slicing": args.adaptive_slicing,
-    "hyperparameter": args.hyperparameter,
-    "percentile": args.percentile,
-}
 
 trainer = Trainer(
     data_name=args.data_name,
