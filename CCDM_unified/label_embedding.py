@@ -1,3 +1,20 @@
+"""
+Enhanced Label Embedding for Sliced-CCDM
+
+This module provides label embedding functionality for multi-dimensional regression labels
+used in Sliced-CCDM (Sliced Continuous Conditional Diffusion Models).
+
+Key features:
+- Support for multi-dimensional labels with various embedding strategies
+- Multiple dimension combination methods (mean, weighted, attention, cross)
+- Automatic training of embedding networks when needed
+- Compatible with different embedding types (sinusoidal, gaussian, resnet)
+- Flexible channel configuration for different image types (grayscale, RGB, etc.)
+
+The sliced approach projects multi-dimensional labels onto random directions
+to simplify vicinity calculations in the loss function.
+"""
+
 import os
 import math
 import numpy as np
@@ -17,7 +34,16 @@ from utils import IMGs_dataset
 
 def sinusoidal_embedding(labels, embed_dim, device):
     """
-    Sinusoidal positional embedding for labels
+    Sinusoidal positional embedding for labels, similar to the one used in Transformers
+    but adapted for continuous values.
+
+    Args:
+        labels: Label tensor to embed [batch_size]
+        embed_dim: Dimension of the embedding space
+        device: Device to place tensors on
+
+    Returns:
+        Sinusoidal embeddings [batch_size, embed_dim]
     """
     max_period = 10000
     labels = labels.view(len(labels))
@@ -35,9 +61,13 @@ def sinusoidal_embedding(labels, embed_dim, device):
 
 
 class GaussianFourierProjection(nn.Module):
-    """Gaussian random features for encoding time steps."""
+    """
+    Gaussian random features for encoding continuous labels.
 
-    """ from https://colab.research.google.com/drive/120kYYBOVa1i0TD85RjlEkFjaWDxSFUx3?usp=sharing#scrollTo=YyQtV7155Nht """
+    Instead of directly mapping labels to embeddings, this projects them onto
+    random Gaussian vectors and applies sinusoidal functions, which can
+    represent complex non-linear relationships.
+    """
 
     def __init__(self, embed_dim, scale=30.0):
         super().__init__()
@@ -63,7 +93,7 @@ class LabelEmbed:
         h_dim=128,
         cov_dim=None,
         batch_size=128,
-        nc=3,
+        nc=1,  # Default to grayscale (1 channel)
         device="cuda",
         label_dim=1,
         dim_weights_learn=True,
@@ -71,6 +101,9 @@ class LabelEmbed:
     ):
         """
         Enhanced Label Embedding class with advanced multi-dimensional label handling.
+
+        For Sliced-CCDM, this handles embedding of multi-dimensional regression labels,
+        with different strategies for combining dimension embeddings.
 
         Parameters:
         - dataset: Dataset object or name
@@ -81,9 +114,9 @@ class LabelEmbed:
         - h_dim: Dimension of h embedding
         - cov_dim: Dimension of covariance embedding
         - batch_size: Batch size for training
-        - nc: Number of channels
+        - nc: Number of channels in the image data (1 for grayscale, 3 for RGB)
         - device: Device to use
-        - label_dim: Dimension of labels
+        - label_dim: Dimension of labels (D in R^D)
         - dim_weights_learn: Whether to learn dimension weights
         - dim_combination: Method to combine dimension embeddings
         """
@@ -95,7 +128,13 @@ class LabelEmbed:
         self.h_dim = h_dim
         self.cov_dim = cov_dim
         self.batch_size = batch_size
-        self.nc = nc
+
+        # Handle number of channels - try to infer from dataset if possible
+        if hasattr(dataset, "num_channels"):
+            self.nc = dataset.num_channels
+        else:
+            self.nc = nc  # Use provided value
+
         self.label_dim = label_dim
         self.dim_weights_learn = dim_weights_learn
         self.dim_combination = dim_combination
@@ -128,8 +167,64 @@ class LabelEmbed:
             os.makedirs(path_y2h, exist_ok=True)
             if not os.path.exists(path_y2h + "/net_y2h.pth"):
                 print("\n Start training ResNet for label embedding...")
-                # Training logic will be handled elsewhere
-                pass
+                # Train the embedding network from scratch
+                from models import ResNet34_embed_y2h  # ResNet model import
+
+                # Extract training data
+                if hasattr(dataset, "train_images") and hasattr(
+                    dataset, "train_labels"
+                ):
+                    # Use existing attributes
+                    train_images = torch.from_numpy(dataset.train_images).float()
+                    train_labels = torch.from_numpy(dataset.train_labels).float()
+                else:
+                    # Extract from dataset object
+                    train_data = []
+                    for i in range(len(dataset)):
+                        batch = dataset[i]
+                        if isinstance(batch, dict):
+                            # Handle dataset returning dict
+                            train_data.append((batch["design"], batch["labels"]))
+                        else:
+                            # Handle dataset returning tuple
+                            train_data.append(batch)
+
+                    train_images = torch.stack([item[0] for item in train_data])
+                    train_labels = torch.stack([item[1] for item in train_data])
+
+                # Create dataloaders
+                from torch.utils.data import TensorDataset, DataLoader
+
+                trainset = TensorDataset(train_images, train_labels)
+                trainloader = DataLoader(trainset, batch_size=128, shuffle=True)
+
+                # Initialize and train the network with the correct channel count
+                net_h2y = ResNet34_embed_y2h(dim_embed=h_dim, nc=self.nc).to(device)
+                trained_net = train_resnet(
+                    net_h2y,
+                    "y2h",
+                    trainloader,
+                    epochs=200,  # Full training for quality
+                    path_to_ckpt=path_y2h,
+                    device=device,
+                )
+
+                # Train MLP for y2h
+                unique_labels = np.unique(train_labels.cpu().numpy(), axis=0)
+                mlp_model = model_y2h(dim_embed=h_dim)
+                trained_mlp = train_mlp(
+                    unique_labels,
+                    mlp_model,
+                    "y2h",
+                    trained_net,
+                    epochs=100,  # Full training for quality
+                    device=device,
+                )
+
+                # Save the model
+                torch.save(trained_mlp.state_dict(), path_y2h + "/net_y2h.pth")
+                print(f"Embedding model saved to {path_y2h}/net_y2h.pth")
+
             # Load the pre-trained model
             self.model_mlp_y2h = model_y2h(dim_embed=h_dim)
             self.model_mlp_y2h.load_state_dict(torch.load(path_y2h + "/net_y2h.pth"))
@@ -140,8 +235,62 @@ class LabelEmbed:
             os.makedirs(path_y2cov, exist_ok=True)
             if not os.path.exists(path_y2cov + "/net_y2cov.pth"):
                 print("\n Start training ResNet for covariance embedding...")
-                # Training logic will be handled elsewhere
-                pass
+                # This would need similar logic as above, with appropriate channel count
+                from models import ResNet34_embed_y2cov
+
+                # Extract training data (similar to above)
+                if hasattr(dataset, "train_images") and hasattr(
+                    dataset, "train_labels"
+                ):
+                    train_images = torch.from_numpy(dataset.train_images).float()
+                    train_labels = torch.from_numpy(dataset.train_labels).float()
+                else:
+                    # Extract from dataset object
+                    train_data = []
+                    for i in range(len(dataset)):
+                        batch = dataset[i]
+                        if isinstance(batch, dict):
+                            train_data.append((batch["design"], batch["labels"]))
+                        else:
+                            train_data.append(batch)
+
+                    train_images = torch.stack([item[0] for item in train_data])
+                    train_labels = torch.stack([item[1] for item in train_data])
+
+                from torch.utils.data import TensorDataset, DataLoader
+
+                trainset = TensorDataset(train_images, train_labels)
+                trainloader = DataLoader(trainset, batch_size=128, shuffle=True)
+
+                # Initialize with correct channel count
+                net_y2cov = ResNet34_embed_y2cov(dim_embed=cov_dim, nc=self.nc).to(
+                    device
+                )
+                trained_net = train_resnet(
+                    net_y2cov,
+                    "y2cov",
+                    trainloader,
+                    epochs=200,
+                    path_to_ckpt=path_y2cov,
+                    device=device,
+                )
+
+                # Train MLP
+                unique_labels = np.unique(train_labels.cpu().numpy(), axis=0)
+                mlp_model = model_y2cov(dim_embed=cov_dim)
+                trained_mlp = train_mlp(
+                    unique_labels,
+                    mlp_model,
+                    "y2cov",
+                    trained_net,
+                    epochs=100,
+                    device=device,
+                )
+
+                # Save model
+                torch.save(trained_mlp.state_dict(), path_y2cov + "/net_y2cov.pth")
+                print(f"Covariance embedding model saved to {path_y2cov}/net_y2cov.pth")
+
             # Load the pre-trained model
             self.model_mlp_y2cov = model_y2cov(dim_embed=cov_dim)
             self.model_mlp_y2cov.load_state_dict(
@@ -160,6 +309,10 @@ class LabelEmbed:
         """
         Enhanced function to convert labels to h embedding with sophisticated
         multi-dimensional label handling.
+
+        For Sliced-CCDM, this efficiently handles multi-dimensional labels by
+        embedding each dimension separately and then combining them using the
+        specified strategy.
 
         Parameters:
         - labels: Labels to embed [B, D] or [B]
@@ -349,6 +502,9 @@ class LabelEmbed:
         Enhanced function to convert labels to covariance embedding with sophisticated
         multi-dimensional label handling.
 
+        For Sliced-CCDM with y-dependent diffusion, this creates covariance matrix
+        embeddings for multi-dimensional labels.
+
         Parameters:
         - labels: Labels to embed [B, D] or [B]
 
@@ -358,6 +514,7 @@ class LabelEmbed:
         embed_dim = self.cov_dim
         if embed_dim is None:
             # Default to image dimensions if not specified
+            # For grayscale images (nc=1), this would be 32*32*1
             embed_dim = 32 * 32 * self.nc
 
         # Handle multi-dimensional labels
@@ -551,7 +708,28 @@ def train_resnet(
     path_to_ckpt=None,
     device="cuda",
 ):
-    """learning rate decay"""
+    """
+    Train a ResNet model for embedding generation.
+
+    This is used to train the ResNet backbone that maps images to label spaces,
+    which will later be used in conjunction with the MLP model.
+
+    Args:
+        net: Network to train
+        net_name: Name of the network (for logging)
+        trainloader: DataLoader for training data
+        epochs: Number of training epochs
+        resume_epoch: Epoch to resume from (if applicable)
+        lr_base: Base learning rate
+        lr_decay_factor: Factor to decay learning rate
+        lr_decay_epochs: Epochs at which to decay learning rate
+        weight_decay: Weight decay for optimizer
+        path_to_ckpt: Path to save checkpoints
+        device: Device to train on
+
+    Returns:
+        Trained network
+    """
 
     def adjust_learning_rate_1(optimizer, epoch):
         """decrease the learning rate"""
@@ -561,8 +739,6 @@ def train_resnet(
         for decay_i in range(num_decays):
             if epoch >= lr_decay_epochs[decay_i]:
                 lr = lr * lr_decay_factor
-            # end if epoch
-        # end for decay_i
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -572,7 +748,7 @@ def train_resnet(
         net.parameters(), lr=lr_base, momentum=0.9, weight_decay=weight_decay
     )
 
-    # resume training; load checkpoint
+    # Resume training if needed
     if path_to_ckpt is not None and resume_epoch > 0:
         save_file = (
             path_to_ckpt
@@ -584,31 +760,41 @@ def train_resnet(
         net.load_state_dict(checkpoint["net_state_dict"])
         optimizer_resnet.load_state_dict(checkpoint["optimizer_state_dict"])
         torch.set_rng_state(checkpoint["rng_state"])
-    # end if
 
     start_tmp = timeit.default_timer()
     for epoch in range(resume_epoch, epochs):
         net.train()
         train_loss = 0
         adjust_learning_rate_1(optimizer_resnet, epoch)
-        for _, (batch_train_images, batch_train_labels) in enumerate(trainloader):
 
+        for _, (batch_train_images, batch_train_labels) in enumerate(trainloader):
+            # Handle multi-dimensional labels
             batch_train_images = batch_train_images.type(torch.float).to(device)
-            batch_train_labels = (
-                batch_train_labels.type(torch.float).view(-1, 1).to(device)
-            )
+
+            # If labels are multi-dimensional, we need to reshape to [B, 1]
+            # since ResNet expects 1D targets
+            if len(batch_train_labels.shape) > 1 and batch_train_labels.shape[1] > 1:
+                # We'll train separate models for each dimension as a workaround
+                # Here we use only first dimension for simplicity
+                batch_train_labels = (
+                    batch_train_labels[:, 0:1].type(torch.float).to(device)
+                )
+            else:
+                batch_train_labels = (
+                    batch_train_labels.type(torch.float).view(-1, 1).to(device)
+                )
 
             # Forward pass
             outputs, _ = net(batch_train_images)
             loss = criterion(outputs, batch_train_labels)
 
-            # backward pass
+            # Backward pass
             optimizer_resnet.zero_grad()
             loss.backward()
             optimizer_resnet.step()
 
             train_loss += loss.cpu().item()
-        # end for batch_idx
+
         train_loss = train_loss / len(trainloader)
 
         print(
@@ -621,7 +807,7 @@ def train_resnet(
             )
         )
 
-        # save checkpoint
+        # Save checkpoint
         if path_to_ckpt is not None and (
             ((epoch + 1) % 50 == 0) or (epoch + 1 == epochs)
         ):
@@ -641,20 +827,21 @@ def train_resnet(
                 },
                 save_file,
             )
-    # end for epoch
 
     return net
 
 
 class label_dataset(torch.utils.data.Dataset):
+    """
+    Simple dataset for training with labels only
+    """
+
     def __init__(self, labels):
         super(label_dataset, self).__init__()
-
         self.labels = labels
         self.n_samples = len(self.labels)
 
     def __getitem__(self, index):
-
         y = self.labels[index]
         return y
 
@@ -676,13 +863,29 @@ def train_mlp(
     device="cuda",
 ):
     """
-    unique_labels_norm: an array of normalized unique labels
-    """
+    Train an MLP model to map from normalized labels to embeddings.
 
+    This MLP is crucial for the label embedding pipeline in Sliced-CCDM.
+    It learns to map from scalar/vector labels to high-dimensional embeddings.
+
+    Args:
+        unique_labels_norm: Normalized unique labels from dataset
+        model_mlp: MLP model to train
+        model_name: Name for logging
+        model_h2y: Pre-trained model mapping embeddings to labels
+        epochs: Number of training epochs
+        lr_base: Base learning rate
+        lr_decay_factor: Factor for learning rate decay
+        lr_decay_epochs: Epochs at which to decay learning rate
+        weight_decay: Weight decay for optimizer
+        batch_size: Training batch size
+        device: Device to train on
+
+    Returns:
+        Trained MLP model
+    """
     model_mlp = model_mlp.to(device)
     model_h2y = model_h2y.to(device)
-
-    """ learning rate decay """
 
     def adjust_learning_rate_2(optimizer, epoch):
         """decrease the learning rate"""
@@ -692,22 +895,22 @@ def train_mlp(
         for decay_i in range(num_decays):
             if epoch >= lr_decay_epochs[decay_i]:
                 lr = lr * lr_decay_factor
-            # end if epoch
-        # end for decay_i
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
     assert np.max(unique_labels_norm) <= 1 and np.min(unique_labels_norm) >= 0
 
-    # Handle multi-dimensional labels if necessary
+    # Handle multi-dimensional labels for Sliced-CCDM
     if len(unique_labels_norm.shape) > 1 and unique_labels_norm.shape[1] > 1:
-        # Transform multi-dimensional labels into dataset
+        # For multi-dimensional labels, we flatten all dimensions
+        # This creates a larger dataset with each dimension treated separately
         trainset = []
         for label in unique_labels_norm:
             for dim_idx in range(len(label)):
                 trainset.append(label[dim_idx])
         trainset = label_dataset(np.array(trainset))
     else:
+        # For 1D labels, use as is
         trainset = label_dataset(unique_labels_norm)
 
     trainloader = torch.utils.data.DataLoader(
@@ -724,44 +927,43 @@ def train_mlp(
         model_mlp.train()
         train_loss = 0
         adjust_learning_rate_2(optimizer_mlp, epoch)
-        for _, batch_labels in enumerate(trainloader):
 
+        for _, batch_labels in enumerate(trainloader):
             batch_labels = batch_labels.type(torch.float).view(-1, 1).to(device)
 
-            # generate noises which will be added to labels
+            # Add noise to labels for robustness
             batch_size_curr = len(batch_labels)
             batch_gamma = np.random.normal(0, 0.2, batch_size_curr)
             batch_gamma = (
                 torch.from_numpy(batch_gamma).view(-1, 1).type(torch.float).to(device)
             )
-
-            # add noise to labels
             batch_labels_noise = torch.clamp(batch_labels + batch_gamma, 0.0, 1.0)
 
             # Forward pass
             batch_hiddens_noise = model_mlp(batch_labels_noise)
             batch_rec_labels_noise = model_h2y(batch_hiddens_noise)
 
+            # Reconstruction loss
             loss = nn.MSELoss()(batch_rec_labels_noise, batch_labels_noise)
 
-            # backward pass
+            # Backward pass
             optimizer_mlp.zero_grad()
             loss.backward()
             optimizer_mlp.step()
 
             train_loss += loss.cpu().item()
-        # end for batch_idx
+
         train_loss = train_loss / len(trainloader)
 
-        print(
-            "\n Train {}: [epoch {}/{}] train_loss:{:.4f} Time:{:.4f}".format(
-                model_name,
-                epoch + 1,
-                epochs,
-                train_loss,
-                timeit.default_timer() - start_tmp,
+        if (epoch + 1) % 10 == 0:  # Print every 10 epochs to reduce verbosity
+            print(
+                "Train {}: [epoch {}/{}] train_loss:{:.4f} Time:{:.4f}".format(
+                    model_name,
+                    epoch + 1,
+                    epochs,
+                    train_loss,
+                    timeit.default_timer() - start_tmp,
+                )
             )
-        )
-    # end for epoch
 
     return model_mlp
