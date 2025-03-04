@@ -34,6 +34,80 @@ class GaussianFourierProjection(nn.Module):
         return x_emb.view(len(x_emb), self.embed_dim)
 
 
+class CrossAttention(nn.Module):
+    """
+    Cross-attention mechanism for combining embeddings from different dimensions.
+    This allows for rich interactions between different dimensions of the label vector.
+    """
+
+    def __init__(self, embed_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert (
+            self.head_dim * num_heads == embed_dim
+        ), "embed_dim must be divisible by num_heads"
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, embeddings):
+        """
+        Args:
+            embeddings: Stacked embeddings from different dimensions [D, B, embed_dim]
+        Returns:
+            Combined embedding with cross-attention [B, embed_dim]
+        """
+        D, B, E = embeddings.shape
+
+        # Reshape for attention computation
+        embeddings = embeddings.transpose(0, 1)  # [B, D, E]
+
+        # Project queries, keys, and values
+        q = self.q_proj(embeddings)  # [B, D, E]
+        k = self.k_proj(embeddings)  # [B, D, E]
+        v = self.v_proj(embeddings)  # [B, D, E]
+
+        # Reshape for multi-head attention
+        q = q.view(B, D, self.num_heads, self.head_dim).transpose(
+            1, 2
+        )  # [B, H, D, head_dim]
+        k = k.view(B, D, self.num_heads, self.head_dim).transpose(
+            1, 2
+        )  # [B, H, D, head_dim]
+        v = v.view(B, D, self.num_heads, self.head_dim).transpose(
+            1, 2
+        )  # [B, H, D, head_dim]
+
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(
+            self.head_dim
+        )  # [B, H, D, D]
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+
+        # Apply attention to values
+        out = torch.matmul(attn, v)  # [B, H, D, head_dim]
+
+        # Reshape back
+        out = out.transpose(1, 2).contiguous().view(B, D, E)  # [B, D, E]
+
+        # Combine dimension embeddings using mean
+        out = out.mean(dim=1)  # [B, E]
+
+        # Apply output projection and normalization
+        out = self.out_proj(out)
+        out = self.norm(out)
+
+        return out
+
+
 class LabelEmbed:
     def __init__(
         self,
@@ -47,8 +121,8 @@ class LabelEmbed:
         batch_size=128,
         nc=3,
         device="cuda",
-        label_dim=1,  # Added parameter for label dimension
-        dim_combination="attention",  # Strategy for combining dimension embeddings
+        label_dim=1,  # Dimension of regression labels
+        dim_combination="cross",  # Strategy for combining dimension embeddings
     ):
         """
         Enhanced Label Embedding class for handling multi-dimensional labels in Sliced-CCDM.
@@ -66,10 +140,20 @@ class LabelEmbed:
             device: Device to use for computation
             label_dim: Dimension of regression labels (scalar=1, vector>1)
             dim_combination: Strategy for combining dimension embeddings
+                            ("mean", "weighted", "attention", "cross", "cross_attention")
         """
         self.dataset = dataset
-        self.path_y2h = path_y2h
-        self.path_y2cov = path_y2cov
+        self.path_y2h = os.path.normpath(path_y2h)
+        if path_y2cov is not None:
+            self.path_y2cov = os.path.normpath(path_y2cov)
+        else:
+            self.path_y2cov = path_y2cov
+
+        print(f"\n Normalized paths:")
+        print(f" - path_y2h: {self.path_y2h}")
+        if self.path_y2cov:
+            print(f" - path_y2cov: {self.path_y2cov}")
+
         self.y2h_type = y2h_type
         self.y2cov_type = y2cov_type
         self.h_dim = h_dim
@@ -80,38 +164,47 @@ class LabelEmbed:
         self.dim_combination = (
             dim_combination  # Strategy for combining dimension embeddings
         )
+        self.device = device
 
         assert y2h_type in ["resnet", "sinusoidal", "gaussian"]
         if y2cov_type is not None:
             assert y2cov_type in ["resnet", "sinusoidal", "gaussian"]
 
-        # Initialize attention network for dimension combination if needed
-        if dim_combination == "attention" and label_dim > 1:
-            self.attention_net = nn.Sequential(
-                nn.Linear(h_dim, h_dim // 2), nn.ReLU(), nn.Linear(h_dim // 2, 1)
-            ).to(device)
+        # Initialize dimension combination mechanisms
+        if label_dim > 1:
+            if dim_combination == "attention":
+                self.attention_net = nn.Sequential(
+                    nn.Linear(h_dim, h_dim // 2), nn.ReLU(), nn.Linear(h_dim // 2, 1)
+                ).to(device)
+                print(f"\n Initialized attention network for dimension combination")
 
-        # Initialize weighting parameters for dimension combination
-        if dim_combination == "weighted" and label_dim > 1:
-            self.dim_weights = nn.Parameter(torch.ones(label_dim) / label_dim)
-            self.dim_weights = self.dim_weights.to(device)
+            elif dim_combination == "weighted":
+                self.dim_weights = nn.Parameter(torch.ones(label_dim) / label_dim)
+                self.dim_weights = self.dim_weights.to(device)
+                print(f"\n Initialized weighted combination for dimensions")
 
-        # For cross-dimension interactions
-        if dim_combination == "cross" and label_dim > 1:
-            self.cross_net = nn.Sequential(
-                nn.Linear(h_dim * label_dim, h_dim * 2),
-                nn.LayerNorm(h_dim * 2),
-                nn.ReLU(),
-                nn.Linear(h_dim * 2, h_dim),
-                nn.LayerNorm(h_dim),
-            ).to(device)
+            elif dim_combination == "cross":
+                self.cross_net = nn.Sequential(
+                    nn.Linear(h_dim * label_dim, h_dim * 2),
+                    nn.LayerNorm(h_dim * 2),
+                    nn.ReLU(),
+                    nn.Linear(h_dim * 2, h_dim),
+                    nn.LayerNorm(h_dim),
+                ).to(device)
+                print(f"\n Initialized cross-dimension network")
+
+            elif dim_combination == "cross_attention":
+                self.cross_attention = CrossAttention(
+                    embed_dim=h_dim, num_heads=4, dropout=0.1
+                ).to(device)
+                print(f"\n Initialized cross-attention mechanism for dimensions")
 
         ## Train or load embedding networks based on selected type
         if y2h_type == "resnet":
             os.makedirs(path_y2h, exist_ok=True)
 
             ## training setups
-            epochs_resnet = 200  # Increased from 10 for better convergence
+            epochs_resnet = 200  # Increased for better convergence
             epochs_mlp = 500
             base_lr_resnet = 1e-4
             base_lr_mlp = 1e-2
@@ -153,6 +246,16 @@ class LabelEmbed:
                 self.path_y2h, "ckpt_mlp_y2h_epoch_{}.pth".format(epochs_mlp)
             )
 
+            # Check for both files existence and print detailed status
+            resnet_exists = os.path.isfile(resnet_y2h_filename_ckpt)
+            mlp_exists = os.path.isfile(mlp_y2h_filename_ckpt)
+
+            print(f"\n Checking for existing embeddings:")
+            print(f" - ResNet checkpoint: {resnet_y2h_filename_ckpt}")
+            print(f"   Exists: {resnet_exists}")
+            print(f" - MLP checkpoint: {mlp_y2h_filename_ckpt}")
+            print(f"   Exists: {mlp_exists}")
+
             # Initialize network with correct input channel count
             model_resnet_y2h = ResNet34_embed_y2h(dim_embed=self.h_dim, nc=self.nc)
             model_resnet_y2h = model_resnet_y2h.to(device)
@@ -162,8 +265,9 @@ class LabelEmbed:
             model_mlp_y2h = model_mlp_y2h.to(device)
             model_mlp_y2h = nn.DataParallel(model_mlp_y2h)
 
-            # Training or loading existing checkpoint
-            if not os.path.isfile(resnet_y2h_filename_ckpt):
+            # Training or loading existing ResNet checkpoint
+            if not resnet_exists:
+                print(f"\n ResNet checkpoint not found at: {resnet_y2h_filename_ckpt}")
                 print("\n Start training CNN for y2h label embedding >>>")
                 model_resnet_y2h = train_resnet(
                     net=model_resnet_y2h,
@@ -177,6 +281,7 @@ class LabelEmbed:
                     weight_decay=1e-4,
                     path_to_ckpt=self.path_y2h,
                     label_dim=self.label_dim,
+                    device=device,
                 )
                 # Save model
                 torch.save(
@@ -186,13 +291,41 @@ class LabelEmbed:
                     resnet_y2h_filename_ckpt,
                 )
             else:
-                print("\n resnet_y2h ckpt already exists")
-                print("\n Loading...")
-                checkpoint = torch.load(resnet_y2h_filename_ckpt, map_location=device)
-                model_resnet_y2h.load_state_dict(checkpoint["net_state_dict"])
+                print(f"\n Loading ResNet checkpoint from: {resnet_y2h_filename_ckpt}")
+                try:
+                    checkpoint = torch.load(
+                        resnet_y2h_filename_ckpt, map_location=device
+                    )
+                    model_resnet_y2h.load_state_dict(checkpoint["net_state_dict"])
+                    print(" Successfully loaded ResNet checkpoint!")
+                except Exception as e:
+                    print(f" Error loading checkpoint: {e}")
+                    print(" Falling back to training...")
+                    model_resnet_y2h = train_resnet(
+                        net=model_resnet_y2h,
+                        net_name="resnet_y2h",
+                        trainloader=trainloader,
+                        epochs=epochs_resnet,
+                        resume_epoch=0,
+                        lr_base=base_lr_resnet,
+                        lr_decay_factor=0.1,
+                        lr_decay_epochs=[80, 140],
+                        weight_decay=1e-4,
+                        path_to_ckpt=self.path_y2h,
+                        label_dim=self.label_dim,
+                        device=device,
+                    )
+                    # Save model
+                    torch.save(
+                        {
+                            "net_state_dict": model_resnet_y2h.state_dict(),
+                        },
+                        resnet_y2h_filename_ckpt,
+                    )
 
             # Train or load MLP
-            if not os.path.isfile(mlp_y2h_filename_ckpt):
+            if not mlp_exists:
+                print(f"\n MLP checkpoint not found at: {mlp_y2h_filename_ckpt}")
                 print("\n Start training mlp_y2h >>>")
                 model_h2y = model_resnet_y2h.module.h2y
                 model_mlp_y2h = train_mlp(
@@ -217,10 +350,36 @@ class LabelEmbed:
                     mlp_y2h_filename_ckpt,
                 )
             else:
-                print("\n model mlp_y2h ckpt already exists")
-                print("\n Loading...")
-                checkpoint = torch.load(mlp_y2h_filename_ckpt, map_location=device)
-                model_mlp_y2h.load_state_dict(checkpoint["net_state_dict"])
+                print(f"\n Loading MLP checkpoint from: {mlp_y2h_filename_ckpt}")
+                try:
+                    checkpoint = torch.load(mlp_y2h_filename_ckpt, map_location=device)
+                    model_mlp_y2h.load_state_dict(checkpoint["net_state_dict"])
+                    print(" Successfully loaded MLP checkpoint!")
+                except Exception as e:
+                    print(f" Error loading checkpoint: {e}")
+                    print(" Falling back to training...")
+                    model_h2y = model_resnet_y2h.module.h2y
+                    model_mlp_y2h = train_mlp(
+                        unique_labels_norm=unique_labels_norm,
+                        model_mlp=model_mlp_y2h,
+                        model_name="mlp_y2h",
+                        model_h2y=model_h2y,
+                        epochs=epochs_mlp,
+                        lr_base=base_lr_mlp,
+                        lr_decay_factor=0.1,
+                        lr_decay_epochs=[150, 250, 350],
+                        weight_decay=1e-4,
+                        batch_size=128,
+                        label_dim=self.label_dim,
+                        device=device,
+                    )
+                    # Save model
+                    torch.save(
+                        {
+                            "net_state_dict": model_mlp_y2h.state_dict(),
+                        },
+                        mlp_y2h_filename_ckpt,
+                    )
 
             self.model_mlp_y2h = model_mlp_y2h
 
@@ -228,14 +387,16 @@ class LabelEmbed:
             print("\n Testing y2h embedding with sample labels...")
             if self.label_dim > 1:
                 # For multi-dimensional labels, test with a few random samples
-                indx_tmp = np.random.choice(len(unique_labels_norm), 5)
+                indx_tmp = np.random.choice(
+                    len(unique_labels_norm), min(5, len(unique_labels_norm))
+                )
                 labels_tmp = unique_labels_norm[indx_tmp]
                 labels_tmp = torch.from_numpy(labels_tmp).float().to(device)
             else:
                 # For scalar labels, use the original approach
                 indx_tmp = np.arange(len(unique_labels_norm))
                 np.random.shuffle(indx_tmp)
-                indx_tmp = indx_tmp[:5]
+                indx_tmp = indx_tmp[: min(5, len(unique_labels_norm))]
                 labels_tmp = unique_labels_norm[indx_tmp].reshape(-1, 1)
                 labels_tmp = torch.from_numpy(labels_tmp).float().to(device)
 
@@ -319,6 +480,16 @@ class LabelEmbed:
                 self.path_y2cov, "ckpt_mlp_y2cov_epoch_{}.pth".format(epochs_mlp)
             )
 
+            # Check for both files existence and print detailed status
+            resnet_exists = os.path.isfile(resnet_y2cov_filename_ckpt)
+            mlp_exists = os.path.isfile(mlp_y2cov_filename_ckpt)
+
+            print(f"\n Checking for existing covariance embeddings:")
+            print(f" - ResNet checkpoint: {resnet_y2cov_filename_ckpt}")
+            print(f"   Exists: {resnet_exists}")
+            print(f" - MLP checkpoint: {mlp_y2cov_filename_ckpt}")
+            print(f"   Exists: {mlp_exists}")
+
             # Initialize networks
             model_resnet_y2cov = ResNet34_embed_y2cov(
                 dim_embed=self.cov_dim, nc=self.nc
@@ -331,7 +502,10 @@ class LabelEmbed:
             model_mlp_y2cov = nn.DataParallel(model_mlp_y2cov)
 
             # Train or load ResNet
-            if not os.path.isfile(resnet_y2cov_filename_ckpt):
+            if not resnet_exists:
+                print(
+                    f"\n ResNet checkpoint not found at: {resnet_y2cov_filename_ckpt}"
+                )
                 print("\n Start training CNN for y2cov label embedding >>>")
                 model_resnet_y2cov = train_resnet(
                     net=model_resnet_y2cov,
@@ -345,6 +519,7 @@ class LabelEmbed:
                     weight_decay=1e-4,
                     path_to_ckpt=self.path_y2cov,
                     label_dim=self.label_dim,
+                    device=device,
                 )
                 torch.save(
                     {
@@ -353,13 +528,42 @@ class LabelEmbed:
                     resnet_y2cov_filename_ckpt,
                 )
             else:
-                print("\n resnet_y2cov ckpt already exists")
-                print("\n Loading...")
-                checkpoint = torch.load(resnet_y2cov_filename_ckpt, map_location=device)
-                model_resnet_y2cov.load_state_dict(checkpoint["net_state_dict"])
+                print(
+                    f"\n Loading ResNet checkpoint from: {resnet_y2cov_filename_ckpt}"
+                )
+                try:
+                    checkpoint = torch.load(
+                        resnet_y2cov_filename_ckpt, map_location=device
+                    )
+                    model_resnet_y2cov.load_state_dict(checkpoint["net_state_dict"])
+                    print(" Successfully loaded ResNet checkpoint!")
+                except Exception as e:
+                    print(f" Error loading checkpoint: {e}")
+                    print(" Falling back to training...")
+                    model_resnet_y2cov = train_resnet(
+                        net=model_resnet_y2cov,
+                        net_name="resnet_y2cov",
+                        trainloader=trainloader,
+                        epochs=epochs_resnet,
+                        resume_epoch=0,
+                        lr_base=base_lr_resnet,
+                        lr_decay_factor=0.1,
+                        lr_decay_epochs=[80, 140],
+                        weight_decay=1e-4,
+                        path_to_ckpt=self.path_y2cov,
+                        label_dim=self.label_dim,
+                        device=device,
+                    )
+                    torch.save(
+                        {
+                            "net_state_dict": model_resnet_y2cov.state_dict(),
+                        },
+                        resnet_y2cov_filename_ckpt,
+                    )
 
             # Train or load MLP
-            if not os.path.isfile(mlp_y2cov_filename_ckpt):
+            if not mlp_exists:
+                print(f"\n MLP checkpoint not found at: {mlp_y2cov_filename_ckpt}")
                 print("\n Start training mlp_y2cov >>>")
                 model_h2y = model_resnet_y2cov.module.h2y
                 model_mlp_y2cov = train_mlp(
@@ -383,10 +587,37 @@ class LabelEmbed:
                     mlp_y2cov_filename_ckpt,
                 )
             else:
-                print("\n model mlp_y2cov ckpt already exists")
-                print("\n Loading...")
-                checkpoint = torch.load(mlp_y2cov_filename_ckpt, map_location=device)
-                model_mlp_y2cov.load_state_dict(checkpoint["net_state_dict"])
+                print(f"\n Loading MLP checkpoint from: {mlp_y2cov_filename_ckpt}")
+                try:
+                    checkpoint = torch.load(
+                        mlp_y2cov_filename_ckpt, map_location=device
+                    )
+                    model_mlp_y2cov.load_state_dict(checkpoint["net_state_dict"])
+                    print(" Successfully loaded MLP checkpoint!")
+                except Exception as e:
+                    print(f" Error loading checkpoint: {e}")
+                    print(" Falling back to training...")
+                    model_h2y = model_resnet_y2cov.module.h2y
+                    model_mlp_y2cov = train_mlp(
+                        unique_labels_norm=unique_labels_norm,
+                        model_mlp=model_mlp_y2cov,
+                        model_name="mlp_y2cov",
+                        model_h2y=model_h2y,
+                        epochs=epochs_mlp,
+                        lr_base=base_lr_mlp,
+                        lr_decay_factor=0.1,
+                        lr_decay_epochs=[150, 250, 350],
+                        weight_decay=1e-4,
+                        batch_size=128,
+                        label_dim=self.label_dim,
+                        device=device,
+                    )
+                    torch.save(
+                        {
+                            "net_state_dict": model_mlp_y2cov.state_dict(),
+                        },
+                        mlp_y2cov_filename_ckpt,
+                    )
 
             self.model_mlp_y2cov = model_mlp_y2cov
 
@@ -394,14 +625,16 @@ class LabelEmbed:
             print("\n Testing y2cov embedding...")
             if self.label_dim > 1:
                 # For multi-dimensional labels
-                indx_tmp = np.random.choice(len(unique_labels_norm), 5)
+                indx_tmp = np.random.choice(
+                    len(unique_labels_norm), min(5, len(unique_labels_norm))
+                )
                 labels_tmp = unique_labels_norm[indx_tmp]
                 labels_tmp = torch.from_numpy(labels_tmp).float().to(device)
             else:
                 # For scalar labels
                 indx_tmp = np.arange(len(unique_labels_norm))
                 np.random.shuffle(indx_tmp)
-                indx_tmp = indx_tmp[:5]
+                indx_tmp = indx_tmp[: min(5, len(unique_labels_norm))]
                 labels_tmp = unique_labels_norm[indx_tmp].reshape(-1, 1)
                 labels_tmp = torch.from_numpy(labels_tmp).float().to(device)
 
@@ -421,17 +654,16 @@ class LabelEmbed:
             embedding: Embedded labels [B, h_dim]
         """
         embed_dim = self.h_dim
+        device = labels.device
 
         # Handle multi-dimensional labels
         if len(labels.shape) > 1 and labels.shape[1] > 1:
-            device = labels.device
+            # Process each dimension separately
+            dim_embeddings = []
+            for d in range(labels.shape[1]):
+                dim_labels = labels[:, d].view(len(labels))
 
-            if self.y2h_type == "sinusoidal":
-                # Process each dimension separately
-                dim_embeddings = []
-                for d in range(labels.shape[1]):
-                    dim_labels = labels[:, d].view(len(labels))
-
+                if self.y2h_type == "sinusoidal":
                     # Create sinusoidal embedding for this dimension
                     max_period = 10000
                     half = embed_dim // 2
@@ -450,129 +682,74 @@ class LabelEmbed:
                         )
 
                     dim_embed = (dim_embed + 1) / 2  # Ensure in range [0,1]
-                    dim_embeddings.append(dim_embed)
 
-                # Stack dimension embeddings
-                stacked_embeddings = torch.stack(dim_embeddings)  # [D, B, embed_dim]
-
-                # Combine based on selected strategy
-                if self.dim_combination == "mean":
-                    # Simple mean across dimensions
-                    embedding = torch.mean(stacked_embeddings, dim=0)  # [B, embed_dim]
-
-                elif self.dim_combination == "weighted":
-                    # Weighted sum across dimensions
-                    weights = F.softmax(self.dim_weights, dim=0)  # [D]
-                    weights = weights.view(-1, 1, 1)  # [D, 1, 1]
-                    embedding = torch.sum(
-                        stacked_embeddings * weights, dim=0
-                    )  # [B, embed_dim]
-
-                elif self.dim_combination == "attention":
-                    # Attention-based weighting
-                    stacked_for_attn = stacked_embeddings.permute(
-                        1, 0, 2
-                    )  # [B, D, embed_dim]
-
-                    # Generate attention scores
-                    attn_scores = self.attention_net(stacked_for_attn).squeeze(
-                        -1
-                    )  # [B, D]
-                    attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(
-                        -1
-                    )  # [B, D, 1]
-
-                    # Apply attention weights
-                    embedding = torch.sum(
-                        stacked_for_attn * attn_weights, dim=1
-                    )  # [B, embed_dim]
-
-                elif self.dim_combination == "cross":
-                    # Consider cross-dimension interactions
-                    stacked_for_cross = stacked_embeddings.permute(
-                        1, 0, 2
-                    )  # [B, D, embed_dim]
-                    batch_size = stacked_for_cross.shape[0]
-
-                    # Flatten all dimension embeddings
-                    flattened = stacked_for_cross.reshape(
-                        batch_size, -1
-                    )  # [B, D*embed_dim]
-
-                    # Process through cross-dimension network
-                    embedding = self.cross_net(flattened)  # [B, embed_dim]
-
-                else:
-                    # Default to mean
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-
-            elif self.y2h_type == "gaussian":
-                # Process each dimension separately
-                dim_embeddings = []
-                for d in range(labels.shape[1]):
-                    dim_labels = labels[:, d].view(-1, 1)
-
+                elif self.y2h_type == "gaussian":
                     # Use Gaussian Fourier projection
                     gfp = GaussianFourierProjection(embed_dim=embed_dim).to(device)
-                    dim_embed = gfp(dim_labels)
+                    dim_embed = gfp(dim_labels.unsqueeze(-1))
                     dim_embed = (dim_embed + 1) / 2  # Ensure in range [0,1]
-                    dim_embeddings.append(dim_embed)
 
-                # Combine using the same strategy as for sinusoidal
-                stacked_embeddings = torch.stack(dim_embeddings)
-
-                if self.dim_combination == "mean":
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-                elif self.dim_combination == "weighted":
-                    weights = F.softmax(self.dim_weights, dim=0)
-                    weights = weights.view(-1, 1, 1)
-                    embedding = torch.sum(stacked_embeddings * weights, dim=0)
-                elif self.dim_combination == "attention":
-                    stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
-                    attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)
-                    attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
-                    embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
-                elif self.dim_combination == "cross":
-                    stacked_for_cross = stacked_embeddings.permute(1, 0, 2)
-                    batch_size = stacked_for_cross.shape[0]
-                    flattened = stacked_for_cross.reshape(batch_size, -1)
-                    embedding = self.cross_net(flattened)
-                else:
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-
-            elif self.y2h_type == "resnet":
-                # ResNet-based embedding for multi-dimensional labels
-                self.model_mlp_y2h.eval()
-                self.model_mlp_y2h = self.model_mlp_y2h.to(device)
-
-                # Process each dimension separately
-                dim_embeddings = []
-                for d in range(labels.shape[1]):
-                    dim_labels = labels[:, d].view(-1, 1)
+                elif self.y2h_type == "resnet":
+                    # Use trained MLP for embedding
+                    self.model_mlp_y2h.eval()
+                    dim_labels = dim_labels.view(-1, 1)
                     dim_embed = self.model_mlp_y2h(dim_labels)
-                    dim_embeddings.append(dim_embed)
 
-                # Combine dimension embeddings
-                stacked_embeddings = torch.stack(dim_embeddings)
+                dim_embeddings.append(dim_embed)
 
-                if self.dim_combination == "mean":
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-                elif self.dim_combination == "weighted":
-                    weights = F.softmax(self.dim_weights, dim=0)
-                    weights = weights.view(-1, 1, 1)
-                    embedding = torch.sum(stacked_embeddings * weights, dim=0)
-                elif self.dim_combination == "attention":
-                    stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
-                    attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)
-                    attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
-                    embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
-                elif self.dim_combination == "cross":
-                    stacked_for_cross = stacked_embeddings.permute(1, 0, 2)
-                    batch_size = stacked_for_cross.shape[0]
-                    flattened = stacked_for_cross.reshape(batch_size, -1)
-                    embedding = self.cross_net(flattened)
-                else:
-                    embedding = torch.mean(stacked_embeddings, dim=0)
+            # Stack dimension embeddings
+            stacked_embeddings = torch.stack(dim_embeddings)  # [D, B, embed_dim]
+
+            # Combine based on selected strategy
+            if self.dim_combination == "mean":
+                # Simple mean across dimensions
+                embedding = torch.mean(stacked_embeddings, dim=0)  # [B, embed_dim]
+
+            elif self.dim_combination == "weighted":
+                # Weighted sum across dimensions
+                weights = F.softmax(self.dim_weights, dim=0)  # [D]
+                weights = weights.view(-1, 1, 1)  # [D, 1, 1]
+                embedding = torch.sum(
+                    stacked_embeddings * weights, dim=0
+                )  # [B, embed_dim]
+
+            elif self.dim_combination == "attention":
+                # Attention-based weighting
+                stacked_for_attn = stacked_embeddings.permute(
+                    1, 0, 2
+                )  # [B, D, embed_dim]
+
+                # Generate attention scores
+                attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)  # [B, D]
+                attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, D, 1]
+
+                # Apply attention weights
+                embedding = torch.sum(
+                    stacked_for_attn * attn_weights, dim=1
+                )  # [B, embed_dim]
+
+            elif self.dim_combination == "cross":
+                # Consider cross-dimension interactions
+                stacked_for_cross = stacked_embeddings.permute(
+                    1, 0, 2
+                )  # [B, D, embed_dim]
+                batch_size = stacked_for_cross.shape[0]
+
+                # Flatten all dimension embeddings
+                flattened = stacked_for_cross.reshape(
+                    batch_size, -1
+                )  # [B, D*embed_dim]
+
+                # Process through cross-dimension network
+                embedding = self.cross_net(flattened)  # [B, embed_dim]
+
+            elif self.dim_combination == "cross_attention":
+                # Use cross-attention mechanism
+                embedding = self.cross_attention(stacked_embeddings)  # [B, embed_dim]
+
+            else:
+                # Default to mean
+                embedding = torch.mean(stacked_embeddings, dim=0)
 
         else:
             # Original code for scalar labels
@@ -594,12 +771,14 @@ class LabelEmbed:
                 embedding = (embedding + 1) / 2  # make sure in [0,1]
 
             elif self.y2h_type == "gaussian":
-                embedding = GaussianFourierProjection(embed_dim=embed_dim)(labels)
+                embedding = GaussianFourierProjection(embed_dim=embed_dim).to(device)(
+                    labels
+                )
                 embedding = (embedding + 1) / 2  # make sure in [0,1]
 
             elif self.y2h_type == "resnet":
                 self.model_mlp_y2h.eval()
-                self.model_mlp_y2h = self.model_mlp_y2h.to(labels.device)
+                self.model_mlp_y2h = self.model_mlp_y2h.to(device)
                 embedding = self.model_mlp_y2h(labels)
 
         return embedding
@@ -615,17 +794,16 @@ class LabelEmbed:
             embedding: Covariance embedding [B, cov_dim]
         """
         embed_dim = self.cov_dim
+        device = labels.device
 
         # Handle multi-dimensional labels
         if len(labels.shape) > 1 and labels.shape[1] > 1:
-            device = labels.device
+            # Process each dimension separately
+            dim_embeddings = []
+            for d in range(labels.shape[1]):
+                dim_labels = labels[:, d].view(len(labels))
 
-            if self.y2cov_type == "sinusoidal":
-                # Process each dimension separately
-                dim_embeddings = []
-                for d in range(labels.shape[1]):
-                    dim_labels = labels[:, d].view(len(labels))
-
+                if self.y2cov_type == "sinusoidal":
                     # Create sinusoidal embedding
                     max_period = 10000
                     half = embed_dim // 2
@@ -644,96 +822,51 @@ class LabelEmbed:
 
                     # For covariance, ensure positive embeddings
                     dim_embed = dim_embed + 1
-                    dim_embeddings.append(dim_embed)
 
-                # Combine dimension embeddings
-                stacked_embeddings = torch.stack(dim_embeddings)
-
-                if self.dim_combination == "mean":
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-                elif self.dim_combination == "weighted":
-                    weights = F.softmax(self.dim_weights, dim=0)
-                    weights = weights.view(-1, 1, 1)
-                    embedding = torch.sum(stacked_embeddings * weights, dim=0)
-                elif self.dim_combination == "attention":
-                    stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
-                    attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)
-                    attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
-                    embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
-                elif self.dim_combination == "cross":
-                    stacked_for_cross = stacked_embeddings.permute(1, 0, 2)
-                    batch_size = stacked_for_cross.shape[0]
-                    flattened = stacked_for_cross.reshape(batch_size, -1)
-                    embedding = self.cross_net(flattened)
-                else:
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-
-            elif self.y2cov_type == "gaussian":
-                # Process each dimension with Gaussian Fourier projection
-                dim_embeddings = []
-                for d in range(labels.shape[1]):
-                    dim_labels = labels[:, d].view(-1, 1)
+                elif self.y2cov_type == "gaussian":
+                    # Use Gaussian Fourier projection
                     gfp = GaussianFourierProjection(embed_dim=embed_dim).to(device)
-                    dim_embed = gfp(dim_labels)
+                    dim_embed = gfp(dim_labels.unsqueeze(-1))
                     # Ensure positive for covariance
                     dim_embed = dim_embed + 1
-                    dim_embeddings.append(dim_embed)
 
-                # Combine dimension embeddings
-                stacked_embeddings = torch.stack(dim_embeddings)
-
-                if self.dim_combination == "mean":
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-                elif self.dim_combination == "weighted":
-                    weights = F.softmax(self.dim_weights, dim=0)
-                    weights = weights.view(-1, 1, 1)
-                    embedding = torch.sum(stacked_embeddings * weights, dim=0)
-                elif self.dim_combination == "attention":
-                    stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
-                    attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)
-                    attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
-                    embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
-                elif self.dim_combination == "cross":
-                    stacked_for_cross = stacked_embeddings.permute(1, 0, 2)
-                    batch_size = stacked_for_cross.shape[0]
-                    flattened = stacked_for_cross.reshape(batch_size, -1)
-                    embedding = self.cross_net(flattened)
-                else:
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-
-            elif self.y2cov_type == "resnet":
-                # ResNet-based covariance embedding
-                self.model_mlp_y2cov.eval()
-                self.model_mlp_y2cov = self.model_mlp_y2cov.to(device)
-
-                # Process each dimension separately
-                dim_embeddings = []
-                for d in range(labels.shape[1]):
-                    dim_labels = labels[:, d].view(-1, 1)
+                elif self.y2cov_type == "resnet":
+                    # Use trained MLP for embedding
+                    self.model_mlp_y2cov.eval()
+                    dim_labels = dim_labels.view(-1, 1)
                     dim_embed = self.model_mlp_y2cov(dim_labels)
-                    dim_embeddings.append(dim_embed)
 
-                # Combine dimension embeddings
-                stacked_embeddings = torch.stack(dim_embeddings)
+                dim_embeddings.append(dim_embed)
 
-                if self.dim_combination == "mean":
-                    embedding = torch.mean(stacked_embeddings, dim=0)
-                elif self.dim_combination == "weighted":
-                    weights = F.softmax(self.dim_weights, dim=0)
-                    weights = weights.view(-1, 1, 1)
-                    embedding = torch.sum(stacked_embeddings * weights, dim=0)
-                elif self.dim_combination == "attention":
-                    stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
-                    attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)
-                    attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
-                    embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
-                elif self.dim_combination == "cross":
-                    stacked_for_cross = stacked_embeddings.permute(1, 0, 2)
-                    batch_size = stacked_for_cross.shape[0]
-                    flattened = stacked_for_cross.reshape(batch_size, -1)
-                    embedding = self.cross_net(flattened)
-                else:
-                    embedding = torch.mean(stacked_embeddings, dim=0)
+            # Stack dimension embeddings
+            stacked_embeddings = torch.stack(dim_embeddings)  # [D, B, embed_dim]
+
+            # Combine based on selected strategy
+            if self.dim_combination == "mean":
+                embedding = torch.mean(stacked_embeddings, dim=0)
+
+            elif self.dim_combination == "weighted":
+                weights = F.softmax(self.dim_weights, dim=0)
+                weights = weights.view(-1, 1, 1)
+                embedding = torch.sum(stacked_embeddings * weights, dim=0)
+
+            elif self.dim_combination == "attention":
+                stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
+                attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)
+                attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
+                embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
+
+            elif self.dim_combination == "cross":
+                stacked_for_cross = stacked_embeddings.permute(1, 0, 2)
+                batch_size = stacked_for_cross.shape[0]
+                flattened = stacked_for_cross.reshape(batch_size, -1)
+                embedding = self.cross_net(flattened)
+
+            elif self.dim_combination == "cross_attention":
+                embedding = self.cross_attention(stacked_embeddings)
+
+            else:
+                embedding = torch.mean(stacked_embeddings, dim=0)
 
         else:
             # Original code for scalar labels
@@ -755,15 +888,35 @@ class LabelEmbed:
                 embedding = embedding + 1  # make sure embedding is not negative
 
             elif self.y2cov_type == "gaussian":
-                embedding = GaussianFourierProjection(embed_dim=embed_dim)(labels)
+                embedding = GaussianFourierProjection(embed_dim=embed_dim).to(device)(
+                    labels
+                )
                 embedding = embedding + 1  # make sure embedding is not negative
 
             elif self.y2cov_type == "resnet":
                 self.model_mlp_y2cov.eval()
-                self.model_mlp_y2cov = self.model_mlp_y2cov.to(labels.device)
+                self.model_mlp_y2cov = self.model_mlp_y2cov.to(device)
                 embedding = self.model_mlp_y2cov(labels)
 
         return embedding
+
+
+class label_dataset(torch.utils.data.Dataset):
+    """
+    Dataset for training with labels, supporting multi-dimensional labels.
+    """
+
+    def __init__(self, labels):
+        super(label_dataset, self).__init__()
+        self.labels = labels
+        self.n_samples = len(self.labels)
+
+    def __getitem__(self, index):
+        y = self.labels[index]
+        return y
+
+    def __len__(self):
+        return self.n_samples
 
 
 def train_resnet(
@@ -777,8 +930,8 @@ def train_resnet(
     lr_decay_epochs=[80, 140],
     weight_decay=1e-4,
     path_to_ckpt=None,
-    device="cuda",
     label_dim=1,
+    device="cuda",
 ):
     """
     Train a ResNet model for embedding generation with multi-dimensional label support.
@@ -794,8 +947,8 @@ def train_resnet(
         lr_decay_epochs: List of epochs where learning rate will be reduced
         weight_decay: Weight decay for optimizer
         path_to_ckpt: Path to save checkpoints
-        device: Device to train on
         label_dim: Dimension of regression labels
+        device: Device to train on
 
     Returns:
         Trained network
@@ -821,16 +974,20 @@ def train_resnet(
 
     # Resume training; load checkpoint
     if path_to_ckpt is not None and resume_epoch > 0:
-        save_file = (
-            path_to_ckpt
-            + "/{}_ckpt_in_train/{}_checkpoint_epoch_{}.pth".format(
-                net_name, net_name, resume_epoch
-            )
+        save_dir = os.path.join(path_to_ckpt, f"{net_name}_ckpt_in_train")
+        os.makedirs(save_dir, exist_ok=True)
+        save_file = os.path.join(
+            save_dir, f"{net_name}_checkpoint_epoch_{resume_epoch}.pth"
         )
-        checkpoint = torch.load(save_file, map_location=device)
-        net.load_state_dict(checkpoint["net_state_dict"])
-        optimizer_resnet.load_state_dict(checkpoint["optimizer_state_dict"])
-        torch.set_rng_state(checkpoint["rng_state"])
+
+        if os.path.isfile(save_file):
+            print(f"Loading checkpoint from {save_file}")
+            checkpoint = torch.load(save_file, map_location=device)
+            net.load_state_dict(checkpoint["net_state_dict"])
+            optimizer_resnet.load_state_dict(checkpoint["optimizer_state_dict"])
+            torch.set_rng_state(checkpoint["rng_state"])
+        else:
+            print(f"No checkpoint found at {save_file}, starting from scratch")
 
     start_tmp = timeit.default_timer()
     for epoch in range(resume_epoch, epochs):
@@ -893,13 +1050,12 @@ def train_resnet(
         if path_to_ckpt is not None and (
             ((epoch + 1) % 50 == 0) or (epoch + 1 == epochs)
         ):
-            save_file = (
-                path_to_ckpt
-                + "/{}_ckpt_in_train/{}_checkpoint_epoch_{}.pth".format(
-                    net_name, net_name, epoch + 1
-                )
+            save_dir = os.path.join(path_to_ckpt, f"{net_name}_ckpt_in_train")
+            os.makedirs(save_dir, exist_ok=True)
+            save_file = os.path.join(
+                save_dir, f"{net_name}_checkpoint_epoch_{epoch + 1}.pth"
             )
-            os.makedirs(os.path.dirname(save_file), exist_ok=True)
+
             torch.save(
                 {
                     "epoch": epoch,
@@ -913,24 +1069,6 @@ def train_resnet(
     return net
 
 
-class label_dataset(torch.utils.data.Dataset):
-    """
-    Dataset for training with labels, supporting multi-dimensional labels.
-    """
-
-    def __init__(self, labels):
-        super(label_dataset, self).__init__()
-        self.labels = labels
-        self.n_samples = len(self.labels)
-
-    def __getitem__(self, index):
-        y = self.labels[index]
-        return y
-
-    def __len__(self):
-        return self.n_samples
-
-
 def train_mlp(
     unique_labels_norm,
     model_mlp,
@@ -942,8 +1080,8 @@ def train_mlp(
     lr_decay_epochs=[150, 250, 350],
     weight_decay=1e-4,
     batch_size=128,
-    device="cuda",
     label_dim=1,
+    device="cuda",
 ):
     """
     Train an MLP model to map normalized labels to embeddings with multi-dimensional support.
@@ -959,8 +1097,8 @@ def train_mlp(
         lr_decay_epochs: List of epochs where learning rate will be reduced
         weight_decay: Weight decay for optimizer
         batch_size: Batch size for training
-        device: Device to train on
         label_dim: Dimension of regression labels
+        device: Device to train on
 
     Returns:
         Trained MLP model
