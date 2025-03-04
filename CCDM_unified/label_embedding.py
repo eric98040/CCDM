@@ -143,12 +143,13 @@ class LabelEmbed:
                             ("mean", "weighted", "attention", "cross", "cross_attention")
         """
         self.dataset = dataset
+        # Fix path handling for Windows compatibility
         self.path_y2h = os.path.normpath(path_y2h)
-        if path_y2cov is not None:
-            self.path_y2cov = os.path.normpath(path_y2cov)
-        else:
-            self.path_y2cov = path_y2cov
+        self.path_y2cov = (
+            os.path.normpath(path_y2cov) if path_y2cov is not None else None
+        )
 
+        # Print normalized paths for debugging
         print(f"\n Normalized paths:")
         print(f" - path_y2h: {self.path_y2h}")
         if self.path_y2cov:
@@ -166,6 +167,7 @@ class LabelEmbed:
         )
         self.device = device
 
+        # Validate embedding types
         assert y2h_type in ["resnet", "sinusoidal", "gaussian"]
         if y2cov_type is not None:
             assert y2cov_type in ["resnet", "sinusoidal", "gaussian"]
@@ -201,10 +203,10 @@ class LabelEmbed:
 
         ## Train or load embedding networks based on selected type
         if y2h_type == "resnet":
-            os.makedirs(path_y2h, exist_ok=True)
+            os.makedirs(self.path_y2h, exist_ok=True)
 
             ## training setups
-            epochs_resnet = 200  # Increased for better convergence
+            epochs_resnet = 200
             epochs_mlp = 500
             base_lr_resnet = 1e-4
             base_lr_mlp = 1e-2
@@ -239,21 +241,57 @@ class LabelEmbed:
                 unique_labels_norm = np.sort(np.array(list(set(train_labels))))
 
             ## Training embedding network for y2h
-            resnet_y2h_filename_ckpt = os.path.join(
-                self.path_y2h, "ckpt_resnet_y2h_epoch_{}.pth".format(epochs_resnet)
-            )
-            mlp_y2h_filename_ckpt = os.path.join(
-                self.path_y2h, "ckpt_mlp_y2h_epoch_{}.pth".format(epochs_mlp)
-            )
+            # Fix checkpoint path handling to look in correct subdirectories
+            resnet_dir = os.path.join(self.path_y2h, "resnet_y2h_ckpt_in_train")
+            mlp_dir = os.path.join(self.path_y2h, "y2h_ckpt_in_train")
 
-            # Check for both files existence and print detailed status
-            resnet_exists = os.path.isfile(resnet_y2h_filename_ckpt)
-            mlp_exists = os.path.isfile(mlp_y2h_filename_ckpt)
+            # Check for resnet checkpoint
+            resnet_exists = False
+            resnet_y2h_filename_ckpt = None
+            if os.path.exists(resnet_dir):
+                # Try to find the expected checkpoint file
+                expected_file = os.path.join(
+                    resnet_dir, f"resnet_y2h_checkpoint_epoch_{epochs_resnet}.pth"
+                )
+                if os.path.isfile(expected_file):
+                    resnet_exists = True
+                    resnet_y2h_filename_ckpt = expected_file
 
+            # Fallback to the original path if not found in subdirectory
+            if not resnet_exists:
+                resnet_y2h_filename_ckpt = os.path.join(
+                    self.path_y2h, f"ckpt_resnet_y2h_epoch_{epochs_resnet}.pth"
+                )
+                resnet_exists = os.path.isfile(resnet_y2h_filename_ckpt)
+
+            # Check for MLP checkpoint
+            mlp_exists = False
+            mlp_y2h_filename_ckpt = None
+            if os.path.exists(mlp_dir):
+                # Try to find the expected checkpoint file
+                expected_file = os.path.join(
+                    mlp_dir, f"mlp_y2h_checkpoint_epoch_{epochs_mlp}.pth"
+                )
+                if os.path.isfile(expected_file):
+                    mlp_exists = True
+                    mlp_y2h_filename_ckpt = expected_file
+
+            # Fallback to the original path if not found in subdirectory
+            if not mlp_exists:
+                mlp_y2h_filename_ckpt = os.path.join(
+                    self.path_y2h, f"ckpt_mlp_y2h_epoch_{epochs_mlp}.pth"
+                )
+                mlp_exists = os.path.isfile(mlp_y2h_filename_ckpt)
+
+            # Print detailed checkpoint information for debugging
             print(f"\n Checking for existing embeddings:")
-            print(f" - ResNet checkpoint: {resnet_y2h_filename_ckpt}")
+            print(f" - ResNet checkpoint directory: {resnet_dir}")
+            print(f"   Exists: {os.path.exists(resnet_dir)}")
+            print(f" - ResNet checkpoint file: {resnet_y2h_filename_ckpt}")
             print(f"   Exists: {resnet_exists}")
-            print(f" - MLP checkpoint: {mlp_y2h_filename_ckpt}")
+            print(f" - MLP checkpoint directory: {mlp_dir}")
+            print(f"   Exists: {os.path.exists(mlp_dir)}")
+            print(f" - MLP checkpoint file: {mlp_y2h_filename_ckpt}")
             print(f"   Exists: {mlp_exists}")
 
             # Initialize network with correct input channel count
@@ -435,9 +473,9 @@ class LabelEmbed:
                     )
 
         # Similar logic for y2cov if needed
-        if y2cov_type == "resnet" and path_y2cov is not None:
+        if y2cov_type == "resnet" and self.path_y2cov is not None:
             # Implementation similar to y2h but for covariance embedding
-            os.makedirs(path_y2cov, exist_ok=True)
+            os.makedirs(self.path_y2cov, exist_ok=True)
 
             ## Training setups
             epochs_resnet = 10
@@ -472,22 +510,57 @@ class LabelEmbed:
             else:
                 unique_labels_norm = np.sort(np.array(list(set(train_labels))))
 
-            # File paths for checkpoints
-            resnet_y2cov_filename_ckpt = os.path.join(
-                self.path_y2cov, "ckpt_resnet_y2cov_epoch_{}.pth".format(epochs_resnet)
-            )
-            mlp_y2cov_filename_ckpt = os.path.join(
-                self.path_y2cov, "ckpt_mlp_y2cov_epoch_{}.pth".format(epochs_mlp)
-            )
+            # Fix checkpoint path handling to look in correct subdirectories
+            resnet_dir = os.path.join(self.path_y2cov, "resnet_y2cov_ckpt_in_train")
+            mlp_dir = os.path.join(self.path_y2cov, "y2cov_ckpt_in_train")
 
-            # Check for both files existence and print detailed status
-            resnet_exists = os.path.isfile(resnet_y2cov_filename_ckpt)
-            mlp_exists = os.path.isfile(mlp_y2cov_filename_ckpt)
+            # Check for resnet checkpoint
+            resnet_exists = False
+            resnet_y2cov_filename_ckpt = None
+            if os.path.exists(resnet_dir):
+                # Try to find the expected checkpoint file
+                expected_file = os.path.join(
+                    resnet_dir, f"resnet_y2cov_checkpoint_epoch_{epochs_resnet}.pth"
+                )
+                if os.path.isfile(expected_file):
+                    resnet_exists = True
+                    resnet_y2cov_filename_ckpt = expected_file
 
+            # Fallback to the original path if not found in subdirectory
+            if not resnet_exists:
+                resnet_y2cov_filename_ckpt = os.path.join(
+                    self.path_y2cov, f"ckpt_resnet_y2cov_epoch_{epochs_resnet}.pth"
+                )
+                resnet_exists = os.path.isfile(resnet_y2cov_filename_ckpt)
+
+            # Check for MLP checkpoint
+            mlp_exists = False
+            mlp_y2cov_filename_ckpt = None
+            if os.path.exists(mlp_dir):
+                # Try to find the expected checkpoint file
+                expected_file = os.path.join(
+                    mlp_dir, f"mlp_y2cov_checkpoint_epoch_{epochs_mlp}.pth"
+                )
+                if os.path.isfile(expected_file):
+                    mlp_exists = True
+                    mlp_y2cov_filename_ckpt = expected_file
+
+            # Fallback to the original path if not found in subdirectory
+            if not mlp_exists:
+                mlp_y2cov_filename_ckpt = os.path.join(
+                    self.path_y2cov, f"ckpt_mlp_y2cov_epoch_{epochs_mlp}.pth"
+                )
+                mlp_exists = os.path.isfile(mlp_y2cov_filename_ckpt)
+
+            # Print detailed checkpoint information for debugging
             print(f"\n Checking for existing covariance embeddings:")
-            print(f" - ResNet checkpoint: {resnet_y2cov_filename_ckpt}")
+            print(f" - ResNet checkpoint directory: {resnet_dir}")
+            print(f"   Exists: {os.path.exists(resnet_dir)}")
+            print(f" - ResNet checkpoint file: {resnet_y2cov_filename_ckpt}")
             print(f"   Exists: {resnet_exists}")
-            print(f" - MLP checkpoint: {mlp_y2cov_filename_ckpt}")
+            print(f" - MLP checkpoint directory: {mlp_dir}")
+            print(f"   Exists: {os.path.exists(mlp_dir)}")
+            print(f" - MLP checkpoint file: {mlp_y2cov_filename_ckpt}")
             print(f"   Exists: {mlp_exists}")
 
             # Initialize networks
@@ -1056,6 +1129,9 @@ def train_resnet(
                 save_dir, f"{net_name}_checkpoint_epoch_{epoch + 1}.pth"
             )
 
+            # Print save path for debugging
+            print(f"Saving checkpoint to: {save_file}")
+
             torch.save(
                 {
                     "epoch": epoch,
@@ -1225,5 +1301,30 @@ def train_mlp(
                     timeit.default_timer() - start_tmp,
                 )
             )
+
+            # Save checkpoint for MLP training
+            save_dir = os.path.join(
+                os.path.dirname(os.path.normpath(model_name)),
+                f"{model_name}_ckpt_in_train",
+            )
+            os.makedirs(save_dir, exist_ok=True)
+            save_file = os.path.join(
+                save_dir, f"{model_name}_checkpoint_epoch_{epoch + 1}.pth"
+            )
+
+            print(f"Saving MLP checkpoint to: {save_file}")
+
+            try:
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "net_state_dict": model_mlp.state_dict(),
+                        "optimizer_state_dict": optimizer_mlp.state_dict(),
+                        "rng_state": torch.get_rng_state(),
+                    },
+                    save_file,
+                )
+            except Exception as e:
+                print(f"Error saving MLP checkpoint: {e}")
 
     return model_mlp
