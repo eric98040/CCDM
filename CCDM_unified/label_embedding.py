@@ -140,7 +140,7 @@ class LabelEmbed:
             device: Device to use for computation
             label_dim: Dimension of regression labels (scalar=1, vector>1)
             dim_combination: Strategy for combining dimension embeddings
-                            ("mean", "weighted", "attention", "cross")
+                            ("mean", "weighted", "attention", "cross", "cross_attention")
         """
         self.dataset = dataset
         # Fix path handling for Windows compatibility
@@ -175,10 +175,22 @@ class LabelEmbed:
         # Initialize dimension combination mechanisms
         if label_dim > 1:
             if dim_combination == "attention":
-                self.attention_net = nn.Sequential(
+                # Create separate attention networks for h and cov embeddings
+                self.h_attention_net = nn.Sequential(
                     nn.Linear(h_dim, h_dim // 2), nn.ReLU(), nn.Linear(h_dim // 2, 1)
                 ).to(device)
-                print(f"\n Initialized attention network for dimension combination")
+                print(f"\n Initialized h attention network for dimension combination")
+
+                # Create separate attention network for covariance embeddings
+                if self.y2cov_type is not None:
+                    self.cov_attention_net = nn.Sequential(
+                        nn.Linear(self.cov_dim, self.cov_dim // 2),
+                        nn.ReLU(),
+                        nn.Linear(self.cov_dim // 2, 1),
+                    ).to(device)
+                    print(
+                        f"\n Initialized cov attention network for dimension combination"
+                    )
 
             elif dim_combination == "weighted":
                 self.dim_weights = nn.Parameter(torch.ones(label_dim) / label_dim)
@@ -186,20 +198,40 @@ class LabelEmbed:
                 print(f"\n Initialized weighted combination for dimensions")
 
             elif dim_combination == "cross":
-                self.cross_net = nn.Sequential(
+                self.h_cross_net = nn.Sequential(
                     nn.Linear(h_dim * label_dim, h_dim * 2),
                     nn.LayerNorm(h_dim * 2),
                     nn.ReLU(),
                     nn.Linear(h_dim * 2, h_dim),
                     nn.LayerNorm(h_dim),
                 ).to(device)
-                print(f"\n Initialized cross-dimension network")
+                print(f"\n Initialized h cross-dimension network")
+
+                # Create separate cross network for covariance embeddings
+                if self.y2cov_type is not None:
+                    self.cov_cross_net = nn.Sequential(
+                        nn.Linear(self.cov_dim * label_dim, self.cov_dim * 2),
+                        nn.LayerNorm(self.cov_dim * 2),
+                        nn.ReLU(),
+                        nn.Linear(self.cov_dim * 2, self.cov_dim),
+                        nn.LayerNorm(self.cov_dim),
+                    ).to(device)
+                    print(f"\n Initialized cov cross-dimension network")
 
             elif dim_combination == "cross_attention":
-                self.cross_attention = CrossAttention(
+                self.h_cross_attention = CrossAttention(
                     embed_dim=h_dim, num_heads=4, dropout=0.1
                 ).to(device)
-                print(f"\n Initialized cross-attention mechanism for dimensions")
+                print(f"\n Initialized h cross-attention mechanism for dimensions")
+
+                # Create separate cross-attention network for covariance embeddings
+                if self.y2cov_type is not None:
+                    self.cov_cross_attention = CrossAttention(
+                        embed_dim=self.cov_dim, num_heads=4, dropout=0.1
+                    ).to(device)
+                    print(
+                        f"\n Initialized cov cross-attention mechanism for dimensions"
+                    )
 
         ## Train or load embedding networks based on selected type
         if y2h_type == "resnet":
@@ -241,86 +273,58 @@ class LabelEmbed:
                 unique_labels_norm = np.sort(np.array(list(set(train_labels))))
 
             ## Training embedding network for y2h
-            # Define checkpoint paths correctly for various directory structures
-            resnet_y2h_ckpt_paths = [
-                # Standard path format
-                os.path.join(
-                    self.path_y2h, f"ckpt_resnet_y2h_epoch_{epochs_resnet}.pth"
-                ),
-                # Alternative format with subdirectory
-                os.path.join(
-                    self.path_y2h,
-                    "resnet_y2h_ckpt_in_train",
-                    f"resnet_y2h_checkpoint_epoch_{epochs_resnet}.pth",
-                ),
-            ]
+            # Fix checkpoint path handling to look in correct subdirectories
+            resnet_dir = os.path.join(self.path_y2h, "resnet_y2h_ckpt_in_train")
+            mlp_dir = os.path.join(self.path_y2h, "y2h_ckpt_in_train")
 
-            mlp_y2h_ckpt_paths = [
-                # Standard path format
-                os.path.join(self.path_y2h, f"ckpt_mlp_y2h_epoch_{epochs_mlp}.pth"),
-                # Alternative format with subdirectory
-                os.path.join(
-                    self.path_y2h,
-                    "y2h_ckpt_in_train",
-                    f"y2h_checkpoint_epoch_{epochs_mlp}.pth",
-                ),
-                # Third option with mlp prefix
-                os.path.join(
-                    self.path_y2h,
-                    "y2h_ckpt_in_train",
-                    f"mlp_y2h_checkpoint_epoch_{epochs_mlp}.pth",
-                ),
-            ]
-
-            # Check for existing resnet checkpoint
+            # Check for resnet checkpoint
             resnet_exists = False
             resnet_y2h_filename_ckpt = None
-
-            for ckpt_path in resnet_y2h_ckpt_paths:
-                if os.path.isfile(ckpt_path):
+            if os.path.exists(resnet_dir):
+                # Try to find the expected checkpoint file
+                expected_file = os.path.join(
+                    resnet_dir, f"resnet_y2h_checkpoint_epoch_{epochs_resnet}.pth"
+                )
+                if os.path.isfile(expected_file):
                     resnet_exists = True
-                    resnet_y2h_filename_ckpt = ckpt_path
-                    break
+                    resnet_y2h_filename_ckpt = expected_file
 
-            # Check for existing MLP checkpoint
-            mlp_exists = False
-            mlp_y2h_filename_ckpt = None
-
-            for ckpt_path in mlp_y2h_ckpt_paths:
-                if os.path.isfile(ckpt_path):
-                    mlp_exists = True
-                    mlp_y2h_filename_ckpt = ckpt_path
-                    break
-
-            # Ensure y2h_ckpt_in_train directory exists
-            os.makedirs(os.path.join(self.path_y2h, "y2h_ckpt_in_train"), exist_ok=True)
-
-            # Create resnet_y2h_ckpt_in_train directory if not exists
-            os.makedirs(
-                os.path.join(self.path_y2h, "resnet_y2h_ckpt_in_train"), exist_ok=True
-            )
-
-            # Print detected checkpoint paths
-            print(f"\n Checking for existing embeddings:")
-            print(f" - ResNet checkpoint file: {resnet_y2h_filename_ckpt}")
-            print(f"   Exists: {resnet_exists}")
-            print(f" - MLP checkpoint file: {mlp_y2h_filename_ckpt}")
-            print(f"   Exists: {mlp_exists}")
-
-            # If checkpoints aren't found, use these as the default save locations
+            # Fallback to the original path if not found in subdirectory
             if not resnet_exists:
                 resnet_y2h_filename_ckpt = os.path.join(
-                    self.path_y2h,
-                    "resnet_y2h_ckpt_in_train",
-                    f"resnet_y2h_checkpoint_epoch_{epochs_resnet}.pth",
+                    self.path_y2h, f"ckpt_resnet_y2h_epoch_{epochs_resnet}.pth"
                 )
+                resnet_exists = os.path.isfile(resnet_y2h_filename_ckpt)
 
+            # Check for MLP checkpoint
+            mlp_exists = False
+            mlp_y2h_filename_ckpt = None
+            if os.path.exists(mlp_dir):
+                # Try to find the expected checkpoint file
+                expected_file = os.path.join(
+                    mlp_dir, f"mlp_y2h_checkpoint_epoch_{epochs_mlp}.pth"
+                )
+                if os.path.isfile(expected_file):
+                    mlp_exists = True
+                    mlp_y2h_filename_ckpt = expected_file
+
+            # Fallback to the original path if not found in subdirectory
             if not mlp_exists:
                 mlp_y2h_filename_ckpt = os.path.join(
-                    self.path_y2h,
-                    "y2h_ckpt_in_train",
-                    f"y2h_checkpoint_epoch_{epochs_mlp}.pth",
+                    self.path_y2h, f"ckpt_mlp_y2h_epoch_{epochs_mlp}.pth"
                 )
+                mlp_exists = os.path.isfile(mlp_y2h_filename_ckpt)
+
+            # Print detailed checkpoint information for debugging
+            print(f"\n Checking for existing embeddings:")
+            print(f" - ResNet checkpoint directory: {resnet_dir}")
+            print(f"   Exists: {os.path.exists(resnet_dir)}")
+            print(f" - ResNet checkpoint file: {resnet_y2h_filename_ckpt}")
+            print(f"   Exists: {resnet_exists}")
+            print(f" - MLP checkpoint directory: {mlp_dir}")
+            print(f"   Exists: {os.path.exists(mlp_dir)}")
+            print(f" - MLP checkpoint file: {mlp_y2h_filename_ckpt}")
+            print(f"   Exists: {mlp_exists}")
 
             # Initialize network with correct input channel count
             model_resnet_y2h = ResNet34_embed_y2h(dim_embed=self.h_dim, nc=self.nc)
@@ -333,7 +337,7 @@ class LabelEmbed:
 
             # Training or loading existing ResNet checkpoint
             if not resnet_exists:
-                print(f"\n ResNet checkpoint not found at any expected location")
+                print(f"\n ResNet checkpoint not found at: {resnet_y2h_filename_ckpt}")
                 print("\n Start training CNN for y2h label embedding >>>")
                 model_resnet_y2h = train_resnet(
                     net=model_resnet_y2h,
@@ -391,13 +395,13 @@ class LabelEmbed:
 
             # Train or load MLP
             if not mlp_exists:
-                print(f"\n MLP checkpoint not found at any expected location")
+                print(f"\n MLP checkpoint not found at: {mlp_y2h_filename_ckpt}")
                 print("\n Start training mlp_y2h >>>")
                 model_h2y = model_resnet_y2h.module.h2y
                 model_mlp_y2h = train_mlp(
                     unique_labels_norm=unique_labels_norm,
                     model_mlp=model_mlp_y2h,
-                    model_name="y2h",  # Changed to match expected filename
+                    model_name="mlp_y2h",
                     model_h2y=model_h2y,
                     epochs=epochs_mlp,
                     lr_base=base_lr_mlp,
@@ -407,7 +411,6 @@ class LabelEmbed:
                     batch_size=128,
                     label_dim=self.label_dim,
                     device=device,
-                    path_to_ckpt=self.path_y2h,  # Added path parameter
                 )
                 # Save model
                 torch.save(
@@ -429,7 +432,7 @@ class LabelEmbed:
                     model_mlp_y2h = train_mlp(
                         unique_labels_norm=unique_labels_norm,
                         model_mlp=model_mlp_y2h,
-                        model_name="y2h",  # Changed to match expected filename
+                        model_name="mlp_y2h",
                         model_h2y=model_h2y,
                         epochs=epochs_mlp,
                         lr_base=base_lr_mlp,
@@ -439,7 +442,6 @@ class LabelEmbed:
                         batch_size=128,
                         label_dim=self.label_dim,
                         device=device,
-                        path_to_ckpt=self.path_y2h,  # Added path parameter
                     )
                     # Save model
                     torch.save(
@@ -540,89 +542,58 @@ class LabelEmbed:
             else:
                 unique_labels_norm = np.sort(np.array(list(set(train_labels))))
 
-            # Define checkpoint paths correctly for various directory structures
-            resnet_y2cov_ckpt_paths = [
-                # Standard path format
-                os.path.join(
-                    self.path_y2cov, f"ckpt_resnet_y2cov_epoch_{epochs_resnet}.pth"
-                ),
-                # Alternative format with subdirectory
-                os.path.join(
-                    self.path_y2cov,
-                    "resnet_y2cov_ckpt_in_train",
-                    f"resnet_y2cov_checkpoint_epoch_{epochs_resnet}.pth",
-                ),
-            ]
+            # Fix checkpoint path handling to look in correct subdirectories
+            resnet_dir = os.path.join(self.path_y2cov, "resnet_y2cov_ckpt_in_train")
+            mlp_dir = os.path.join(self.path_y2cov, "y2cov_ckpt_in_train")
 
-            mlp_y2cov_ckpt_paths = [
-                # Standard path format
-                os.path.join(self.path_y2cov, f"ckpt_mlp_y2cov_epoch_{epochs_mlp}.pth"),
-                # Alternative format with subdirectory
-                os.path.join(
-                    self.path_y2cov,
-                    "y2cov_ckpt_in_train",
-                    f"y2cov_checkpoint_epoch_{epochs_mlp}.pth",
-                ),
-                # Third option with mlp prefix
-                os.path.join(
-                    self.path_y2cov,
-                    "y2cov_ckpt_in_train",
-                    f"mlp_y2cov_checkpoint_epoch_{epochs_mlp}.pth",
-                ),
-            ]
-
-            # Check for existing resnet checkpoint
+            # Check for resnet checkpoint
             resnet_exists = False
             resnet_y2cov_filename_ckpt = None
-
-            for ckpt_path in resnet_y2cov_ckpt_paths:
-                if os.path.isfile(ckpt_path):
+            if os.path.exists(resnet_dir):
+                # Try to find the expected checkpoint file
+                expected_file = os.path.join(
+                    resnet_dir, f"resnet_y2cov_checkpoint_epoch_{epochs_resnet}.pth"
+                )
+                if os.path.isfile(expected_file):
                     resnet_exists = True
-                    resnet_y2cov_filename_ckpt = ckpt_path
-                    break
+                    resnet_y2cov_filename_ckpt = expected_file
 
-            # Check for existing MLP checkpoint
-            mlp_exists = False
-            mlp_y2cov_filename_ckpt = None
-
-            for ckpt_path in mlp_y2cov_ckpt_paths:
-                if os.path.isfile(ckpt_path):
-                    mlp_exists = True
-                    mlp_y2cov_filename_ckpt = ckpt_path
-                    break
-
-            # Ensure y2cov_ckpt_in_train directory exists
-            os.makedirs(
-                os.path.join(self.path_y2cov, "y2cov_ckpt_in_train"), exist_ok=True
-            )
-
-            # Create resnet_y2cov_ckpt_in_train directory if not exists
-            os.makedirs(
-                os.path.join(self.path_y2cov, "resnet_y2cov_ckpt_in_train"),
-                exist_ok=True,
-            )
-
-            # Print detected checkpoint paths
-            print(f"\n Checking for existing covariance embeddings:")
-            print(f" - ResNet checkpoint file: {resnet_y2cov_filename_ckpt}")
-            print(f"   Exists: {resnet_exists}")
-            print(f" - MLP checkpoint file: {mlp_y2cov_filename_ckpt}")
-            print(f"   Exists: {mlp_exists}")
-
-            # If checkpoints aren't found, use these as the default save locations
+            # Fallback to the original path if not found in subdirectory
             if not resnet_exists:
                 resnet_y2cov_filename_ckpt = os.path.join(
-                    self.path_y2cov,
-                    "resnet_y2cov_ckpt_in_train",
-                    f"resnet_y2cov_checkpoint_epoch_{epochs_resnet}.pth",
+                    self.path_y2cov, f"ckpt_resnet_y2cov_epoch_{epochs_resnet}.pth"
                 )
+                resnet_exists = os.path.isfile(resnet_y2cov_filename_ckpt)
 
+            # Check for MLP checkpoint
+            mlp_exists = False
+            mlp_y2cov_filename_ckpt = None
+            if os.path.exists(mlp_dir):
+                # Try to find the expected checkpoint file
+                expected_file = os.path.join(
+                    mlp_dir, f"mlp_y2cov_checkpoint_epoch_{epochs_mlp}.pth"
+                )
+                if os.path.isfile(expected_file):
+                    mlp_exists = True
+                    mlp_y2cov_filename_ckpt = expected_file
+
+            # Fallback to the original path if not found in subdirectory
             if not mlp_exists:
                 mlp_y2cov_filename_ckpt = os.path.join(
-                    self.path_y2cov,
-                    "y2cov_ckpt_in_train",
-                    f"y2cov_checkpoint_epoch_{epochs_mlp}.pth",
+                    self.path_y2cov, f"ckpt_mlp_y2cov_epoch_{epochs_mlp}.pth"
                 )
+                mlp_exists = os.path.isfile(mlp_y2cov_filename_ckpt)
+
+            # Print detailed checkpoint information for debugging
+            print(f"\n Checking for existing covariance embeddings:")
+            print(f" - ResNet checkpoint directory: {resnet_dir}")
+            print(f"   Exists: {os.path.exists(resnet_dir)}")
+            print(f" - ResNet checkpoint file: {resnet_y2cov_filename_ckpt}")
+            print(f"   Exists: {resnet_exists}")
+            print(f" - MLP checkpoint directory: {mlp_dir}")
+            print(f"   Exists: {os.path.exists(mlp_dir)}")
+            print(f" - MLP checkpoint file: {mlp_y2cov_filename_ckpt}")
+            print(f"   Exists: {mlp_exists}")
 
             # Initialize networks
             model_resnet_y2cov = ResNet34_embed_y2cov(
@@ -637,7 +608,9 @@ class LabelEmbed:
 
             # Train or load ResNet
             if not resnet_exists:
-                print(f"\n ResNet checkpoint not found at any expected location")
+                print(
+                    f"\n ResNet checkpoint not found at: {resnet_y2cov_filename_ckpt}"
+                )
                 print("\n Start training CNN for y2cov label embedding >>>")
                 model_resnet_y2cov = train_resnet(
                     net=model_resnet_y2cov,
@@ -695,13 +668,13 @@ class LabelEmbed:
 
             # Train or load MLP
             if not mlp_exists:
-                print(f"\n MLP checkpoint not found at any expected location")
+                print(f"\n MLP checkpoint not found at: {mlp_y2cov_filename_ckpt}")
                 print("\n Start training mlp_y2cov >>>")
                 model_h2y = model_resnet_y2cov.module.h2y
                 model_mlp_y2cov = train_mlp(
                     unique_labels_norm=unique_labels_norm,
                     model_mlp=model_mlp_y2cov,
-                    model_name="y2cov",  # Changed to match expected filename
+                    model_name="mlp_y2cov",
                     model_h2y=model_h2y,
                     epochs=epochs_mlp,
                     lr_base=base_lr_mlp,
@@ -711,7 +684,6 @@ class LabelEmbed:
                     batch_size=128,
                     label_dim=self.label_dim,
                     device=device,
-                    path_to_ckpt=self.path_y2cov,  # Added path parameter
                 )
                 torch.save(
                     {
@@ -734,7 +706,7 @@ class LabelEmbed:
                     model_mlp_y2cov = train_mlp(
                         unique_labels_norm=unique_labels_norm,
                         model_mlp=model_mlp_y2cov,
-                        model_name="y2cov",  # Changed to match expected filename
+                        model_name="mlp_y2cov",
                         model_h2y=model_h2y,
                         epochs=epochs_mlp,
                         lr_base=base_lr_mlp,
@@ -744,7 +716,6 @@ class LabelEmbed:
                         batch_size=128,
                         label_dim=self.label_dim,
                         device=device,
-                        path_to_ckpt=self.path_y2cov,  # Added path parameter
                     )
                     torch.save(
                         {
@@ -853,8 +824,10 @@ class LabelEmbed:
                     1, 0, 2
                 )  # [B, D, embed_dim]
 
-                # Generate attention scores
-                attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)  # [B, D]
+                # Generate attention scores using h-specific attention network
+                attn_scores = self.h_attention_net(stacked_for_attn).squeeze(
+                    -1
+                )  # [B, D]
                 attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, D, 1]
 
                 # Apply attention weights
@@ -875,11 +848,11 @@ class LabelEmbed:
                 )  # [B, D*embed_dim]
 
                 # Process through cross-dimension network
-                embedding = self.cross_net(flattened)  # [B, embed_dim]
+                embedding = self.h_cross_net(flattened)  # [B, embed_dim]
 
             elif self.dim_combination == "cross_attention":
                 # Use cross-attention mechanism
-                embedding = self.cross_attention(stacked_embeddings)  # [B, embed_dim]
+                embedding = self.h_cross_attention(stacked_embeddings)  # [B, embed_dim]
 
             else:
                 # Default to mean
@@ -905,8 +878,9 @@ class LabelEmbed:
                 embedding = (embedding + 1) / 2  # make sure in [0,1]
 
             elif self.y2h_type == "gaussian":
-                gfp = GaussianFourierProjection(embed_dim=embed_dim).to(device)
-                embedding = gfp(labels)
+                embedding = GaussianFourierProjection(embed_dim=embed_dim).to(device)(
+                    labels
+                )
                 embedding = (embedding + 1) / 2  # make sure in [0,1]
 
             elif self.y2h_type == "resnet":
@@ -985,7 +959,8 @@ class LabelEmbed:
 
             elif self.dim_combination == "attention":
                 stacked_for_attn = stacked_embeddings.permute(1, 0, 2)
-                attn_scores = self.attention_net(stacked_for_attn).squeeze(-1)
+                # Use specific attention network for covariance embedding
+                attn_scores = self.cov_attention_net(stacked_for_attn).squeeze(-1)
                 attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)
                 embedding = torch.sum(stacked_for_attn * attn_weights, dim=1)
 
@@ -993,10 +968,12 @@ class LabelEmbed:
                 stacked_for_cross = stacked_embeddings.permute(1, 0, 2)
                 batch_size = stacked_for_cross.shape[0]
                 flattened = stacked_for_cross.reshape(batch_size, -1)
-                embedding = self.cross_net(flattened)
+                # Use specific cross network for covariance embedding
+                embedding = self.cov_cross_net(flattened)
 
             elif self.dim_combination == "cross_attention":
-                embedding = self.cross_attention(stacked_embeddings)
+                # Use specific cross-attention for covariance embedding
+                embedding = self.cov_cross_attention(stacked_embeddings)
 
             else:
                 embedding = torch.mean(stacked_embeddings, dim=0)
@@ -1021,8 +998,9 @@ class LabelEmbed:
                 embedding = embedding + 1  # make sure embedding is not negative
 
             elif self.y2cov_type == "gaussian":
-                gfp = GaussianFourierProjection(embed_dim=embed_dim).to(device)
-                embedding = gfp(labels)
+                embedding = GaussianFourierProjection(embed_dim=embed_dim).to(device)(
+                    labels
+                )
                 embedding = embedding + 1  # make sure embedding is not negative
 
             elif self.y2cov_type == "resnet":
@@ -1217,7 +1195,6 @@ def train_mlp(
     batch_size=128,
     label_dim=1,
     device="cuda",
-    path_to_ckpt=None,  # Added path parameter
 ):
     """
     Train an MLP model to map normalized labels to embeddings with multi-dimensional support.
@@ -1235,7 +1212,6 @@ def train_mlp(
         batch_size: Batch size for training
         label_dim: Dimension of regression labels
         device: Device to train on
-        path_to_ckpt: Path to save checkpoints
 
     Returns:
         Trained MLP model
@@ -1284,11 +1260,6 @@ def train_mlp(
     optimizer_mlp = torch.optim.SGD(
         model_mlp.parameters(), lr=lr_base, momentum=0.9, weight_decay=weight_decay
     )
-
-    # Prepare save directory
-    if path_to_ckpt is not None:
-        save_dir = os.path.join(path_to_ckpt, f"{model_name}_ckpt_in_train")
-        os.makedirs(save_dir, exist_ok=True)
 
     start_tmp = timeit.default_timer()
     for epoch in range(epochs):
@@ -1368,24 +1339,29 @@ def train_mlp(
                 )
             )
 
-            # Save checkpoint if path provided
-            if path_to_ckpt is not None:
-                save_file = os.path.join(
-                    save_dir, f"{model_name}_checkpoint_epoch_{epoch + 1}.pth"
-                )
-                print(f"Saving MLP checkpoint to: {save_file}")
+            # Save checkpoint for MLP training
+            save_dir = os.path.join(
+                os.path.dirname(os.path.normpath(model_name)),
+                f"{model_name}_ckpt_in_train",
+            )
+            os.makedirs(save_dir, exist_ok=True)
+            save_file = os.path.join(
+                save_dir, f"{model_name}_checkpoint_epoch_{epoch + 1}.pth"
+            )
 
-                try:
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "net_state_dict": model_mlp.state_dict(),
-                            "optimizer_state_dict": optimizer_mlp.state_dict(),
-                            "rng_state": torch.get_rng_state(),
-                        },
-                        save_file,
-                    )
-                except Exception as e:
-                    print(f"Error saving MLP checkpoint: {e}")
+            print(f"Saving MLP checkpoint to: {save_file}")
+
+            try:
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "net_state_dict": model_mlp.state_dict(),
+                        "optimizer_state_dict": optimizer_mlp.state_dict(),
+                        "rng_state": torch.get_rng_state(),
+                    },
+                    save_file,
+                )
+            except Exception as e:
+                print(f"Error saving MLP checkpoint: {e}")
 
     return model_mlp
