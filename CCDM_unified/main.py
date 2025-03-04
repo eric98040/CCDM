@@ -59,6 +59,10 @@ if args.torch_model_path != "None":
 # torch.backends.cuda.matmul.allow_tf32 = True
 # torch.backends.cudnn.allow_tf32 = True
 
+# Set device globally
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"\n Using device: {device}")
+
 
 #######################################################################################
 """                                Output folders                                  """
@@ -249,6 +253,47 @@ vicinal_params = {
     "percentile": args.percentile,
 }
 
+# Add Sliced-CCDM specific configuration
+if args.vicinity_type in ["shv", "ssv"]:
+    print("\n Using Sliced Vicinity approach for multi-dimensional labels")
+
+    # Sliced Vicinity optimal parameter settings
+    if args.num_projections <= 0:
+        # Automatically determine number of projections based on label dimension
+        if args.label_dim > 20:
+            args.num_projections = 10
+        elif args.label_dim > 10:
+            args.num_projections = 5
+        elif args.label_dim > 5:
+            args.num_projections = 3
+        else:
+            args.num_projections = 1
+
+        print(
+            f"\r Auto-set number of projections to {args.num_projections} based on label dimension ({args.label_dim})"
+        )
+
+    # Output vector type
+    print(f"\r Using {args.vector_type} vectors for projection")
+
+    # Output Sliced Vicinity parameters
+    print(
+        f"\r Sliced Vicinity parameters: kappa={args.kappa}, sigma_delta={args.kernel_sigma}"
+    )
+
+    # Output detailed information about multi-dimensional labels
+    print(
+        f"\r Label information: dimension={args.label_dim}, min={train_labels.min()}, max={train_labels.max()}"
+    )
+
+    # Update additional optimization parameters
+    vicinal_params.update(
+        {
+            "vector_update_freq": 20,  # Update projection vectors every 20 steps
+            "log_verbose": True,  # Enable debugging logs
+        }
+    )
+
 
 #######################################################################################
 """                             label embedding method                              """
@@ -264,6 +309,7 @@ if args.label_embed == "ccdm1":
         nc=args.num_channels,
         label_dim=args.label_dim,
         dim_combination=args.dim_combination,
+        device=device,  # Pass device explicitly
     )
 elif args.label_embed == "ccdm2":
     label_embedding = LabelEmbed(
@@ -277,6 +323,7 @@ elif args.label_embed == "ccdm2":
         nc=args.num_channels,
         label_dim=args.label_dim,
         dim_combination=args.dim_combination,
+        device=device,  # Pass device explicitly
     )
 else:  # random
     label_embedding = LabelEmbed(
@@ -287,6 +334,7 @@ else:  # random
         nc=args.num_channels,
         label_dim=args.label_dim,
         dim_combination=args.dim_combination,
+        device=device,  # Pass device explicitly
     )
 
 fn_y2h = label_embedding.fn_y2h
@@ -349,7 +397,9 @@ diffusion = GaussianDiffusion(
     beta_schedule=args.beta_schedule,
     ddim_sampling_eta=args.ddim_eta,
     vicinity_type=args.vicinity_type,
-).cuda()
+).to(
+    device
+)  # Explicitly move to device
 
 
 ## for visualization
@@ -366,10 +416,13 @@ for i in range(n_row):
     curr_label = selected_labels[i]
     for j in range(n_col):
         y_visual[i * n_col + j] = curr_label
-y_visual = torch.from_numpy(y_visual).type(torch.float).view(-1).cuda()
+y_visual = (
+    torch.from_numpy(y_visual).type(torch.float).view(-1).to(device)
+)  # Move to device
 print(y_visual)
 
 
+# Initialize trainer with additional Sliced-CCDM parameters
 trainer = Trainer(
     data_name=args.data_name,
     diffusion_model=diffusion,
@@ -404,6 +457,18 @@ trainer = Trainer(
     adaptive_slicing=args.adaptive_slicing,
     hyperparameter=args.hyperparameter,
     percentile=args.percentile,
+    vector_update_freq=vicinal_params.get("vector_update_freq", 10),
+    # Sliced-CCDM optimization parameters
+    adaptive_slicing_params=(
+        {
+            "min_kappa": args.kappa * 0.5,  # Minimum kappa value
+            "max_kappa": args.kappa * 2.0,  # Maximum kappa value
+            "schedule_type": "linear",  # Schedule type (linear, cosine)
+            "warm_up_steps": 1000,  # Warm-up steps
+        }
+        if args.adaptive_slicing
+        else None
+    ),
 )
 
 if args.resume_niter > 0:
